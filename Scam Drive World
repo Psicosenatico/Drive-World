@@ -1,0 +1,641 @@
+--[[
+FULL FLOW SCRIPT CAPTURE
+Objetivo:
+  - Registrar o fluxo completo do script alvo.
+  - Capturar criação/alteração da interface.
+  - Registrar chamadas HTTP e Remotes.
+  - Identificar sucesso/falha da validação da key SEM salvar a key digitada.
+  - Salvar localmente todo código recebido por HttpGet/request e enviado para loadstring.
+  - Destacar o último/maior payload como provável "script final".
+
+IMPORTANTE:
+  - Logs ficam locais no executor.
+  - Chaves, tokens e campos de autenticação são redigidos.
+  - O scanner não envia nada para servidores externos.
+]]
+
+local TARGET_URL = "https://raw.githubusercontent.com/yumyum272/driving/refs/heads/main/script1.lua"
+
+local G = (getgenv and getgenv()) or _G
+local unpack_ = table.unpack or unpack
+
+local SESSION = "FullFlowScan_" .. tostring(os.time())
+local LOG_FILE = SESSION .. "_log.txt"
+local SUMMARY_FILE = SESSION .. "_summary.txt"
+
+local LOGS = {}
+local CAPTURES = {}
+local COUNTER = 0
+local START = os.clock()
+
+local function clock()
+    return string.format("%.3f", os.clock() - START)
+end
+
+local function safe(v)
+    local ok, out = pcall(function()
+        if typeof and typeof(v) == "Instance" then
+            return v:GetFullName()
+        end
+        return tostring(v)
+    end)
+    return ok and out or "<erro tostring>"
+end
+
+local function isSensitiveName(name)
+    name = tostring(name or ""):lower()
+    return name:find("key", 1, true)
+        or name:find("token", 1, true)
+        or name:find("auth", 1, true)
+        or name:find("license", 1, true)
+        or name:find("password", 1, true)
+        or name:find("secret", 1, true)
+end
+
+local function redactString(s, context)
+    if type(s) ~= "string" then
+        return safe(s)
+    end
+
+    if context and isSensitiveName(context) then
+        return "<redigido>"
+    end
+
+    if s:match("^https?://") then
+        return s
+    end
+
+    local lower = s:lower()
+    if lower:find("bearer ", 1, true)
+    or lower:find("authorization", 1, true)
+    or lower:find("token=", 1, true)
+    or lower:find("key=", 1, true)
+    or lower:find("license=", 1, true) then
+        return "<redigido>"
+    end
+
+    if #s >= 24 and s:match("^[%w%-%._]+$") then
+        return string.format("<redigido:%d chars>", #s)
+    end
+
+    if #s > 240 then
+        return s:sub(1, 240) .. string.format("... <%d chars>", #s)
+    end
+
+    return s
+end
+
+local function sanitizeTable(t, depth)
+    depth = depth or 0
+    if depth > 2 then
+        return "{...}"
+    end
+    if type(t) ~= "table" then
+        return redactString(t)
+    end
+
+    local out = {}
+    for k, v in pairs(t) do
+        local key = tostring(k)
+        local shown
+        if isSensitiveName(key) then
+            shown = "<redigido>"
+        elseif type(v) == "table" then
+            shown = sanitizeTable(v, depth + 1)
+        elseif type(v) == "string" then
+            shown = redactString(v, key)
+        else
+            shown = safe(v)
+        end
+        out[#out + 1] = key .. "=" .. shown
+    end
+
+    table.sort(out)
+    return "{" .. table.concat(out, ", ") .. "}"
+end
+
+local function flush()
+    if type(writefile) ~= "function" then
+        return
+    end
+    pcall(writefile, LOG_FILE, table.concat(LOGS, "\n"))
+end
+
+local function log(tag, msg)
+    local line = string.format("[%s] [%s] %s", clock(), tostring(tag), tostring(msg))
+    LOGS[#LOGS + 1] = line
+    print("[FULL-FLOW] " .. line)
+
+    if #LOGS % 8 == 0 then
+        flush()
+    end
+end
+
+local function looksLikeLua(s)
+    if type(s) ~= "string" or #s < 20 then
+        return false
+    end
+
+    local score = 0
+    if s:find("local ", 1, true) then score += 1 end
+    if s:find("function", 1, true) then score += 1 end
+    if s:find("game", 1, true) then score += 1 end
+    if s:find("return", 1, true) then score += 1 end
+    if s:find("Instance.new", 1, true) then score += 1 end
+    if s:find("GetService", 1, true) then score += 1 end
+    if s:find("loadstring", 1, true) then score += 1 end
+    if s:find("--[[", 1, true) then score += 1 end
+
+    return score >= 2
+end
+
+local function saveCapture(kind, source, meta)
+    if type(source) ~= "string" or #source == 0 then
+        return nil
+    end
+
+    COUNTER += 1
+    local name = string.format("%s_%03d_%s.txt", SESSION, COUNTER, tostring(kind):gsub("[^%w_%-]", "_"))
+
+    CAPTURES[#CAPTURES + 1] = {
+        index = COUNTER,
+        kind = tostring(kind),
+        file = name,
+        bytes = #source,
+        meta = tostring(meta or ""),
+        luaLike = looksLikeLua(source),
+        time = clock()
+    }
+
+    if type(writefile) == "function" then
+        local ok, err = pcall(writefile, name, source)
+        if not ok then
+            log("WRITE-ERROR", name .. " -> " .. safe(err))
+        end
+    end
+
+    log(
+        "CAPTURE",
+        string.format(
+            "#%03d | %s | %d bytes | lua=%s | %s",
+            COUNTER,
+            tostring(kind),
+            #source,
+            tostring(looksLikeLua(source)),
+            tostring(meta or "")
+        )
+    )
+
+    return name
+end
+
+local function captureResponse(kind, url, body)
+    if type(body) ~= "string" then
+        return
+    end
+
+    local meta = tostring(url or "?")
+    if looksLikeLua(body) then
+        saveCapture(kind, body, meta)
+    else
+        log(kind, string.format("%s -> %d bytes (não identificado como Lua)", meta, #body))
+    end
+end
+
+local function argsToString(args)
+    local out = {}
+    for i = 1, #args do
+        local v = args[i]
+        if type(v) == "string" then
+            out[#out + 1] = redactString(v)
+        elseif type(v) == "table" then
+            out[#out + 1] = sanitizeTable(v)
+        else
+            out[#out + 1] = safe(v)
+        end
+    end
+    return table.concat(out, ", ")
+end
+
+log("START", "Sessão " .. SESSION)
+log("TARGET", TARGET_URL)
+
+-- ============================================================
+-- CLIPBOARD
+-- ============================================================
+
+do
+    local original = rawget(G, "setclipboard") or setclipboard
+    if type(original) == "function" then
+        local wrapped = function(value, ...)
+            if type(value) == "string" and value:match("^https?://") then
+                log("CLIPBOARD", value)
+            else
+                log("CLIPBOARD", "<conteúdo não registrado>")
+            end
+            return original(value, ...)
+        end
+
+        if type(hookfunction) == "function" then
+            local ok = pcall(hookfunction, original, wrapped)
+            log("HOOK", "setclipboard=" .. tostring(ok))
+        else
+            pcall(function() G.setclipboard = wrapped end)
+        end
+    end
+end
+
+-- ============================================================
+-- EXECUTOR REQUEST FUNCTIONS
+-- ============================================================
+
+local function wrapRequest(name, original)
+    return function(options, ...)
+        local url = "?"
+        local method = "GET"
+        local body = nil
+
+        if type(options) == "table" then
+            url = options.Url or options.URL or options.url or "?"
+            method = options.Method or options.method or "GET"
+            body = options.Body or options.body
+
+            log(
+                "HTTP",
+                string.format(
+                    "%s %s | headers=%s | body=%s",
+                    tostring(method),
+                    tostring(url),
+                    sanitizeTable(options.Headers or options.headers or {}),
+                    type(body) == "string" and redactString(body, "request_body") or safe(body)
+                )
+            )
+        else
+            url = safe(options)
+            log("HTTP", name .. " -> " .. redactString(url))
+        end
+
+        local results = {original(options, ...)}
+        local response = results[1]
+
+        if type(response) == "table" then
+            local status = response.StatusCode or response.Status or response.status_code
+            local responseBody = response.Body or response.body
+
+            log(
+                "HTTP-RESPONSE",
+                string.format("%s | status=%s | bytes=%s", tostring(url), safe(status), type(responseBody) == "string" and #responseBody or "?")
+            )
+
+            captureResponse("request_response", url, responseBody)
+        elseif type(response) == "string" then
+            captureResponse("request_response", url, response)
+        end
+
+        return unpack_(results)
+    end
+end
+
+for _, name in ipairs({"request", "http_request", "httprequest"}) do
+    local original = rawget(G, name)
+    if type(original) == "function" then
+        local wrapped = wrapRequest(name, original)
+
+        if type(hookfunction) == "function" then
+            local ok = pcall(hookfunction, original, wrapped)
+            log("HOOK", name .. "=" .. tostring(ok))
+        else
+            pcall(function() G[name] = wrapped end)
+        end
+    end
+end
+
+if type(rawget(G, "syn")) == "table" and type(G.syn.request) == "function" then
+    local original = G.syn.request
+    local wrapped = wrapRequest("syn.request", original)
+
+    if type(hookfunction) == "function" then
+        local ok = pcall(hookfunction, original, wrapped)
+        log("HOOK", "syn.request=" .. tostring(ok))
+    else
+        pcall(function() G.syn.request = wrapped end)
+    end
+end
+
+-- ============================================================
+-- HttpGet / HttpGetAsync
+-- ============================================================
+
+local function hookHttp(label, fn)
+    if type(fn) ~= "function" or type(hookfunction) ~= "function" then
+        return
+    end
+
+    local old
+    local ok = pcall(function()
+        old = hookfunction(fn, function(self, url, ...)
+            log(label, tostring(url))
+            local result = old(self, url, ...)
+            if type(result) == "string" then
+                log(label .. "-RESULT", string.format("%s -> %d bytes", tostring(url), #result))
+                captureResponse(label .. "_response", url, result)
+            end
+            return result
+        end)
+    end)
+
+    log("HOOK", label .. "=" .. tostring(ok))
+end
+
+pcall(function() hookHttp("HttpGet", game.HttpGet) end)
+pcall(function() hookHttp("HttpGetAsync", game.HttpGetAsync) end)
+
+-- ============================================================
+-- LOADSTRING: principal ponto de captura do script final
+-- ============================================================
+
+local originalLoadstring = rawget(G, "loadstring") or loadstring
+
+if type(originalLoadstring) == "function" then
+    local wrapped = function(source, chunkName, ...)
+        if type(source) == "string" then
+            local file = saveCapture(
+                "loadstring",
+                source,
+                string.format("chunk=%s", tostring(chunkName or "?"))
+            )
+
+            log(
+                "LOADSTRING",
+                string.format(
+                    "arquivo=%s | bytes=%d | chunk=%s",
+                    tostring(file),
+                    #source,
+                    tostring(chunkName or "?")
+                )
+            )
+        else
+            log("LOADSTRING", "entrada não-string: " .. safe(source))
+        end
+
+        return originalLoadstring(source, chunkName, ...)
+    end
+
+    if type(hookfunction) == "function" then
+        local ok = pcall(hookfunction, originalLoadstring, wrapped)
+        log("HOOK", "loadstring=" .. tostring(ok))
+    else
+        pcall(function() G.loadstring = wrapped end)
+    end
+else
+    log("WARN", "loadstring indisponível")
+end
+
+-- ============================================================
+-- UI: criação
+-- ============================================================
+
+pcall(function()
+    if type(hookfunction) ~= "function" then return end
+
+    local oldNew
+    oldNew = hookfunction(Instance.new, function(className, parent, ...)
+        local obj = oldNew(className, parent, ...)
+
+        if className == "ScreenGui"
+        or className == "Frame"
+        or className == "TextLabel"
+        or className == "TextButton"
+        or className == "TextBox"
+        or className == "ImageButton"
+        or className == "ImageLabel"
+        or className == "UICorner"
+        or className == "UIStroke" then
+            log("UI-CREATE", className .. " -> " .. safe(obj))
+        end
+
+        return obj
+    end)
+
+    log("HOOK", "Instance.new=true")
+end)
+
+-- ============================================================
+-- UI: alterações de propriedades
+-- ============================================================
+
+pcall(function()
+    if type(hookmetamethod) ~= "function" or type(newcclosure) ~= "function" then
+        return
+    end
+
+    local oldNewIndex
+    oldNewIndex = hookmetamethod(game, "__newindex", newcclosure(function(self, key, value)
+        local className = nil
+        local okClass = pcall(function()
+            className = self.ClassName
+        end)
+
+        if okClass and (
+            className == "ScreenGui"
+            or className == "Frame"
+            or className == "TextLabel"
+            or className == "TextButton"
+            or className == "TextBox"
+            or className == "ImageButton"
+            or className == "ImageLabel"
+        ) then
+            if key == "Name"
+            or key == "Text"
+            or key == "PlaceholderText"
+            or key == "Visible"
+            or key == "Enabled"
+            or key == "Parent" then
+                local shown = value
+
+                -- Nunca registrar o conteúdo digitado no TextBox.
+                if className == "TextBox" and key == "Text" then
+                    shown = "<redigido>"
+                elseif type(value) == "string" then
+                    shown = redactString(value, key)
+                end
+
+                log(
+                    "UI-SET",
+                    string.format("%s.%s = %s", safe(self), tostring(key), safe(shown))
+                )
+
+                -- Heurística para identificar confirmação da key.
+                if key == "Text" and type(value) == "string" and className ~= "TextBox" then
+                    local lower = value:lower()
+                    if lower:find("success", 1, true)
+                    or lower:find("valid", 1, true)
+                    or lower:find("correct", 1, true)
+                    or lower:find("accepted", 1, true)
+                    or lower:find("sucesso", 1, true)
+                    or lower:find("válid", 1, true)
+                    or lower:find("valida", 1, true) then
+                        log("KEY-STATE", "Possível confirmação POSITIVA: " .. redactString(value))
+                    elseif lower:find("invalid", 1, true)
+                    or lower:find("incorrect", 1, true)
+                    or lower:find("error", 1, true)
+                    or lower:find("inválid", 1, true)
+                    or lower:find("incorreta", 1, true) then
+                        log("KEY-STATE", "Possível confirmação NEGATIVA: " .. redactString(value))
+                    end
+                end
+            end
+        end
+
+        return oldNewIndex(self, key, value)
+    end))
+
+    log("HOOK", "__newindex=true")
+end)
+
+-- ============================================================
+-- __namecall: Remotes, Connect, Destroy, HttpGet e injeções
+-- ============================================================
+
+pcall(function()
+    if type(hookmetamethod) ~= "function"
+    or type(newcclosure) ~= "function"
+    or type(getnamecallmethod) ~= "function" then
+        return
+    end
+
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+
+        if method == "FireServer" or method == "InvokeServer" then
+            log(
+                "REMOTE",
+                string.format(
+                    "%s:%s(%s)",
+                    safe(self),
+                    tostring(method),
+                    argsToString(args)
+                )
+            )
+        elseif method == "Connect" then
+            log("CONNECT", safe(self))
+        elseif method == "Destroy" then
+            log("DESTROY", safe(self))
+        elseif method == "HttpGet" or method == "HttpGetAsync" then
+            log("NAMECALL-" .. method, argsToString(args))
+        elseif method == "Kick" then
+            log("KICK", argsToString(args))
+        end
+
+        return oldNamecall(self, ...)
+    end))
+
+    log("HOOK", "__namecall=true")
+end)
+
+-- ============================================================
+-- STOP / RESUMO
+-- ============================================================
+
+local function makeSummary()
+    local lines = {}
+    lines[#lines + 1] = "FULL FLOW SCAN SUMMARY"
+    lines[#lines + 1] = "Session: " .. SESSION
+    lines[#lines + 1] = "Captures: " .. tostring(#CAPTURES)
+    lines[#lines + 1] = ""
+
+    local largest = nil
+    local lastLua = nil
+
+    for _, c in ipairs(CAPTURES) do
+        lines[#lines + 1] = string.format(
+            "#%03d | %s | %d bytes | lua=%s | %s | %s",
+            c.index,
+            c.kind,
+            c.bytes,
+            tostring(c.luaLike),
+            c.file,
+            c.meta
+        )
+
+        if c.luaLike then
+            lastLua = c
+            if not largest or c.bytes > largest.bytes then
+                largest = c
+            end
+        end
+    end
+
+    lines[#lines + 1] = ""
+
+    if lastLua then
+        lines[#lines + 1] = "PROVAVEL ULTIMO PAYLOAD LUA:"
+        lines[#lines + 1] = lastLua.file
+        lines[#lines + 1] = tostring(lastLua.bytes) .. " bytes"
+    end
+
+    lines[#lines + 1] = ""
+
+    if largest then
+        lines[#lines + 1] = "MAIOR PAYLOAD LUA CAPTURADO:"
+        lines[#lines + 1] = largest.file
+        lines[#lines + 1] = tostring(largest.bytes) .. " bytes"
+    end
+
+    return table.concat(lines, "\n")
+end
+
+G.FULL_FLOW_SCAN_STOP = function()
+    flush()
+    local summary = makeSummary()
+
+    if type(writefile) == "function" then
+        pcall(writefile, SUMMARY_FILE, summary)
+    end
+
+    print("\n========== FULL FLOW SUMMARY ==========\n" .. summary .. "\n=======================================\n")
+    return summary
+end
+
+-- ============================================================
+-- EXECUTA O ALVO
+-- ============================================================
+
+local function runTarget()
+    if type(originalLoadstring) ~= "function" then
+        error("loadstring indisponível")
+    end
+
+    log("RUN", "Baixando script inicial")
+    local source = game:HttpGet(TARGET_URL)
+
+    log("RUN", string.format("Script inicial recebido: %d bytes", #source))
+    saveCapture("initial_target", source, TARGET_URL)
+
+    local chunk, compileErr = originalLoadstring(source, "@FULL_FLOW_TARGET")
+    if not chunk then
+        error("Falha ao compilar alvo: " .. tostring(compileErr))
+    end
+
+    log("RUN", "Executando script inicial sob monitoramento")
+
+    local ok, err = pcall(chunk)
+    if not ok then
+        log("TARGET-ERROR", safe(err))
+    else
+        log("RUN", "Execução inicial concluída; hooks continuam ativos")
+    end
+
+    flush()
+end
+
+local ok, err = pcall(runTarget)
+if not ok then
+    log("SCANNER-ERROR", safe(err))
+end
+
+log("INFO", "Interaja normalmente com a interface/key.")
+log("INFO", "Quando terminar, execute: getgenv().FULL_FLOW_SCAN_STOP()")
+flush()
