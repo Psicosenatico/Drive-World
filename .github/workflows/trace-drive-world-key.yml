@@ -1,0 +1,34 @@
+name: Trace Drive World local key
+
+on:
+  push:
+    paths:
+      - 'Tools/trace_script_lua.lua'
+      - '.github/workflows/trace-drive-world-key.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua 5.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1
+          lua5.1 -v
+      - name: Fetch original loader
+        run: |
+          curl -fsSL 'https://raw.githubusercontent.com/yumyum272/driving/refs/heads/main/script.lua' -o script.lua
+          wc -c script.lua
+          sha1sum script.lua
+      - name: Trace gate callbacks
+        run: |
+          lua5.1 Tools/trace_script_lua.lua | tee trace_key.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drive-world-key-trace
+          path: trace_key.log
