@@ -1,0 +1,2 @@
+-- Pasta criada para o script principal.
+-- Substitua este conteúdo pelo código final quando ele estiver pronto.
