@@ -1,224 +1,266 @@
--- Trace the original Drive World local key gate under Lua 5.1.
--- No Roblox/executor payload is sent anywhere. The target is downloaded by the workflow.
+-- Drive World local key gate tracer for the Luau CLI.
+-- The workflow injects the original script.lua source at __TARGET_EXEC__.
 
 local ALL = {}
 local SIGNALS = {}
 local LOG = {}
+local BASE_PAIRS = pairs
+local BASE_IPAIRS = ipairs
+local BASE_STRING = string
 
 local function out(...)
-  local t={}
-  for i=1,select('#',...) do t[#t+1]=tostring(select(i,...)) end
-  local s=table.concat(t,' ')
-  LOG[#LOG+1]=s
-  print(s)
+    local t = {}
+    for i = 1, select('#', ...) do t[#t + 1] = tostring(select(i, ...)) end
+    local s = table.concat(t, ' ')
+    LOG[#LOG + 1] = s
+    print(s)
 end
 
 local function simple(v)
-  local t=type(v)
-  if t=='string' then return string.format('%q',v) end
-  if t=='number' or t=='boolean' or t=='nil' then return tostring(v) end
-  if t=='function' then return '<function:'..tostring(v)..'>' end
-  if t=='table' then
-    if rawget(v,'__isInstance') then return '<'..tostring(rawget(v,'ClassName'))..':'..tostring(rawget(v,'Name'))..'>' end
-    return '<table:'..tostring(v)..'>'
-  end
-  return '<'..t..':'..tostring(v)..'>'
+    local tv = type(v)
+    if tv == 'string' then return BASE_STRING.format('%q', v) end
+    if tv == 'number' or tv == 'boolean' or tv == 'nil' then return tostring(v) end
+    if tv == 'function' then return '<function:' .. tostring(v) .. '>' end
+    if tv == 'table' then
+        if rawget(v, '__isInstance') then
+            return '<' .. tostring(rawget(v, 'ClassName')) .. ':' .. tostring(rawget(v, 'Name')) .. '>'
+        end
+        return '<table:' .. tostring(v) .. '>'
+    end
+    return '<' .. tv .. ':' .. tostring(v) .. '>'
 end
 
-local Signal={}
-Signal.__index=Signal
-function Signal.new(owner,name)
-  local s=setmetatable({owner=owner,name=name,connections={}},Signal)
-  SIGNALS[#SIGNALS+1]=s
-  return s
+local Signal = {}
+Signal.__index = Signal
+function Signal.new(owner, name)
+    local s = setmetatable({owner = owner, name = name, connections = {}}, Signal)
+    SIGNALS[#SIGNALS + 1] = s
+    return s
 end
 function Signal:Connect(fn)
-  self.connections[#self.connections+1]=fn
-  out('[CONNECT]', simple(self.owner), self.name, 'callback='..tostring(fn))
-  return {Disconnect=function() end, Connected=true}
+    self.connections[#self.connections + 1] = fn
+    out('[CONNECT]', simple(self.owner), self.name, 'callback=' .. tostring(fn))
+    return {Disconnect = function() end, Connected = true}
 end
 function Signal:Fire(...)
-  for _,fn in ipairs(self.connections) do
-    local ok,err=pcall(fn,...)
-    out('[CALLBACK]', self.name, ok and 'OK' or ('ERR '..tostring(err)))
-  end
+    for _, fn in BASE_IPAIRS(self.connections) do
+        local ok, err = pcall(fn, ...)
+        out('[CALLBACK]', self.name, ok and 'OK' or ('ERR ' .. tostring(err)))
+    end
 end
 
-local ObjMethods={}
-local ObjMT={}
-function ObjMT.__index(self,k)
-  local m=ObjMethods[k]
-  if m then return m end
-  local v=rawget(self,k)
-  if v~=nil then return v end
-  if k=='MouseButton1Click' or k=='Activated' or k=='FocusLost' or k=='Changed' then
-    local s=Signal.new(self,k); rawset(self,k,s); return s
-  end
-  return nil
+local ObjMethods = {}
+local ObjMT = {}
+function ObjMT.__index(self, k)
+    local m = ObjMethods[k]
+    if m then return m end
+    local v = rawget(self, k)
+    if v ~= nil then return v end
+    if k == 'MouseButton1Click' or k == 'Activated' or k == 'FocusLost' or k == 'Changed' then
+        local s = Signal.new(self, k)
+        rawset(self, k, s)
+        return s
+    end
+    return nil
 end
-function ObjMT.__newindex(self,k,v)
-  rawset(self,k,v)
-  if k=='Text' or k=='PlaceholderText' or k=='Name' or k=='Parent' or k=='Enabled' or k=='Visible' or k=='Active' then
-    out('[SET]', simple(self), tostring(k), simple(v))
-  end
+function ObjMT.__newindex(self, k, v)
+    rawset(self, k, v)
+    if k == 'Parent' and type(v) == 'table' and rawget(v, '_children') then
+        v._children[#v._children + 1] = self
+    end
+    if k == 'Text' or k == 'PlaceholderText' or k == 'Name' or k == 'Parent' or k == 'Enabled' or k == 'Visible' or k == 'Active' then
+        out('[SET]', simple(self), tostring(k), simple(v))
+    end
 end
 
-local function newObj(class,name)
-  local o=setmetatable({__isInstance=true,ClassName=class,Name=name or class,Parent=nil,_children={}},ObjMT)
-  ALL[#ALL+1]=o
-  return o
+local function newObj(class, name)
+    local o = setmetatable({__isInstance = true, ClassName = class, Name = name or class, Parent = nil, _children = {}}, ObjMT)
+    ALL[#ALL + 1] = o
+    return o
 end
-function ObjMethods:IsA(cls) return self.ClassName==cls or (cls=='GuiObject' and self.ClassName~='ScreenGui') end
+function ObjMethods:IsA(cls)
+    return self.ClassName == cls or (cls == 'GuiObject' and self.ClassName ~= 'ScreenGui')
+end
 function ObjMethods:GetChildren() return self._children end
 function ObjMethods:GetDescendants()
-  local outt={}
-  local function rec(x)
-    for _,c in ipairs(x._children or {}) do outt[#outt+1]=c; rec(c) end
-  end
-  rec(self); return outt
+    local outt = {}
+    local function rec(x)
+        for _, c in BASE_IPAIRS(x._children or {}) do outt[#outt + 1] = c; rec(c) end
+    end
+    rec(self)
+    return outt
 end
 function ObjMethods:FindFirstChild(name)
-  for _,c in ipairs(self._children or {}) do if c.Name==name then return c end end
-  return nil
+    for _, c in BASE_IPAIRS(self._children or {}) do if c.Name == name then return c end end
+    return nil
 end
 function ObjMethods:WaitForChild(name)
-  local x=self:FindFirstChild(name)
-  if x then return x end
-  x=newObj('Folder',name); x.Parent=self; self._children[#self._children+1]=x; return x
+    local x = self:FindFirstChild(name)
+    if x then return x end
+    x = newObj('Folder', name)
+    x.Parent = self
+    return x
 end
-function ObjMethods:Destroy() out('[DESTROY]',simple(self)); self.Parent=nil; self.Destroyed=true end
+function ObjMethods:Destroy()
+    out('[DESTROY]', simple(self))
+    rawset(self, 'Parent', nil)
+    rawset(self, 'Destroyed', true)
+end
 function ObjMethods:GetFullName() return tostring(self.Name) end
-function ObjMethods:GetPropertyChangedSignal(name) return Signal.new(self,'PropertyChanged:'..tostring(name)) end
+function ObjMethods:GetPropertyChangedSignal(name) return Signal.new(self, 'PropertyChanged:' .. tostring(name)) end
 
-local Players=newObj('Players','Players')
-local LocalPlayer=newObj('Player','LocalPlayer')
-local PlayerGui=newObj('PlayerGui','PlayerGui')
-LocalPlayer.PlayerGui=PlayerGui
-Players.LocalPlayer=LocalPlayer
-LocalPlayer._children[#LocalPlayer._children+1]=PlayerGui
-PlayerGui.Parent=LocalPlayer
-local CoreGui=newObj('CoreGui','CoreGui')
+local Players = newObj('Players', 'Players')
+local LocalPlayer = newObj('Player', 'LocalPlayer')
+local PlayerGui = newObj('PlayerGui', 'PlayerGui')
+LocalPlayer.PlayerGui = PlayerGui
+Players.LocalPlayer = LocalPlayer
+PlayerGui.Parent = LocalPlayer
+local CoreGui = newObj('CoreGui', 'CoreGui')
 
-local gameObj=newObj('DataModel','game')
+local gameObj = newObj('DataModel', 'game')
 function ObjMethods:GetService(name)
-  out('[GETSERVICE]',name)
-  if name=='Players' then return Players end
-  if name=='CoreGui' then return CoreGui end
-  local x=newObj(name,name); return x
+    out('[GETSERVICE]', name)
+    if name == 'Players' then return Players end
+    if name == 'CoreGui' then return CoreGui end
+    return newObj(name, name)
 end
 
-game=gameObj
-workspace=newObj('Workspace','Workspace')
+game = gameObj
+workspace = newObj('Workspace', 'Workspace')
 
-Instance={}
-function Instance.new(class,parent)
-  local o=newObj(class,class)
-  if parent then o.Parent=parent; if parent._children then parent._children[#parent._children+1]=o end end
-  out('[INSTANCE]',class)
-  return o
+Instance = {}
+function Instance.new(class, parent)
+    local o = newObj(class, class)
+    if parent then o.Parent = parent end
+    out('[INSTANCE]', class)
+    return o
 end
 
 local function ctor(name)
-  return setmetatable({new=function(...) return {__type=name,args={...}} end,fromRGB=function(...) return {__type=name,args={...}} end,fromOffset=function(...) return {__type=name,args={...}} end,fromScale=function(...) return {__type=name,args={...}} end},{__index=function(t,k) return function(...) return {__type=name..'.'..k,args={...}} end end})
+    return setmetatable({
+        new = function(...) return {__type = name, args = {...}} end,
+        fromRGB = function(...) return {__type = name, args = {...}} end,
+        fromOffset = function(...) return {__type = name, args = {...}} end,
+        fromScale = function(...) return {__type = name, args = {...}} end,
+    }, {__index = function(_, k) return function(...) return {__type = name .. '.' .. k, args = {...}} end end})
 end
-Color3=ctor('Color3'); UDim=ctor('UDim'); UDim2=ctor('UDim2'); Vector2=ctor('Vector2'); Vector3=ctor('Vector3'); CFrame=ctor('CFrame')
-Enum=setmetatable({}, {__index=function(_,a) return setmetatable({}, {__index=function(_,b) return 'Enum.'..tostring(a)..'.'..tostring(b) end}) end})
+Color3 = ctor('Color3')
+UDim = ctor('UDim')
+UDim2 = ctor('UDim2')
+Vector2 = ctor('Vector2')
+Vector3 = ctor('Vector3')
+CFrame = ctor('CFrame')
+Enum = setmetatable({}, {__index = function(_, a)
+    return setmetatable({}, {__index = function(_, b) return 'Enum.' .. tostring(a) .. '.' .. tostring(b) end})
+end})
 
-task={}
-function task.wait(x) out('[TASK.WAIT]',x); return x or 0 end
-function task.spawn(fn,...) out('[TASK.SPAWN]',tostring(fn)); return fn(...) end
-function task.defer(fn,...) out('[TASK.DEFER]',tostring(fn)); return fn(...) end
-wait=task.wait
+task = {}
+function task.wait(x) out('[TASK.WAIT]', x); return x or 0 end
+function task.spawn(fn, ...) out('[TASK.SPAWN]', tostring(fn)); return fn(...) end
+function task.defer(fn, ...) out('[TASK.DEFER]', tostring(fn)); return fn(...) end
+wait = task.wait
 
-function setclipboard(v) out('[SETCLIPBOARD]',simple(v)) end
-function warn(...) out('[WARN]',...) end
-function typeof(v) if type(v)=='table' and v.__isInstance then return 'Instance' end return type(v) end
+function setclipboard(v) out('[SETCLIPBOARD]', simple(v)) end
+function warn(...) out('[WARN]', ...) end
+function typeof(v)
+    if type(v) == 'table' and rawget(v, '__isInstance') then return 'Instance' end
+    return type(v)
+end
 
--- Log key string helpers while preserving behavior.
-local _upper=string.upper
-string.upper=function(s) local r=_upper(s); out('[STRING.UPPER]',simple(s),'->',simple(r)); return r end
-local _match=string.match
-string.match=function(s,p,...) local r=_match(s,p,...); out('[STRING.MATCH]',simple(s),simple(p),'->',simple(r)); return r end
-local _gsub=string.gsub
-string.gsub=function(s,p,r,n) local a,b=_gsub(s,p,r,n); out('[STRING.GSUB]',simple(s),simple(p),'->',simple(a)); return a,b end
-local _tonumber=tonumber
-tonumber=function(v,...) local r=_tonumber(v,...); out('[TONUMBER]',simple(v),'->',simple(r)); return r end
-
--- Load target in the same global environment.
-local target=assert(loadfile('script.lua'))
-local ok,err=pcall(target)
-out('[TARGET]',ok and 'OK' or ('ERR '..tostring(err)))
+-- Keep built-ins untouched while the obfuscator bootstraps (anti-tamper sensitive).
+local ok, err
+__TARGET_EXEC__
+out('[TARGET]', ok and 'OK' or ('ERR ' .. tostring(err)))
 
 out('=== UI OBJECTS ===')
-for i,o in ipairs(ALL) do
-  if o.ClassName=='ScreenGui' or o.ClassName=='TextBox' or o.ClassName=='TextButton' or o.ClassName=='TextLabel' then
-    out('[UI]',i,o.ClassName,'Name='..tostring(o.Name),'Text='..simple(rawget(o,'Text')),'Placeholder='..simple(rawget(o,'PlaceholderText')))
-  end
-end
-
-local seen={}
-local function dumpValue(v,depth,label)
-  if depth>5 then return end
-  local tv=type(v)
-  if tv=='string' or tv=='number' or tv=='boolean' or tv=='nil' then
-    out(string.rep(' ',depth*2)..'[UPVALUE]',label,simple(v)); return
-  end
-  if tv=='table' then
-    if seen[v] then return end; seen[v]=true
-    out(string.rep(' ',depth*2)..'[TABLE]',label,simple(v))
-    local n=0
-    for k,x in pairs(v) do
-      n=n+1; if n>100 then break end
-      local kl='['..simple(k)..']'
-      if type(x)=='string' or type(x)=='number' or type(x)=='boolean' then
-        out(string.rep(' ',(depth+1)*2)..kl,'=',simple(x))
-      elseif type(x)=='table' and not x.__isInstance then
-        dumpValue(x,depth+1,label..kl)
-      elseif type(x)=='function' then
-        dumpValue(x,depth+1,label..kl)
-      end
+for i, o in BASE_IPAIRS(ALL) do
+    if o.ClassName == 'ScreenGui' or o.ClassName == 'TextBox' or o.ClassName == 'TextButton' or o.ClassName == 'TextLabel' then
+        out('[UI]', i, o.ClassName, 'Name=' .. tostring(o.Name), 'Text=' .. simple(rawget(o, 'Text')), 'Placeholder=' .. simple(rawget(o, 'PlaceholderText')))
     end
-  elseif tv=='function' then
-    if seen[v] then return end; seen[v]=true
-    out(string.rep(' ',depth*2)..'[FUNCTION]',label,tostring(v))
-    local i=1
-    while true do
-      local name,val=debug.getupvalue(v,i)
-      if not name then break end
-      if type(val)=='string' or type(val)=='number' or type(val)=='boolean' or type(val)=='table' or type(val)=='function' then
-        dumpValue(val,depth+1,label..'.'..name)
-      end
-      i=i+1
+end
+
+-- Find visible access gate.
+local box = nil
+local unlockSignals = {}
+for _, o in BASE_IPAIRS(ALL) do
+    if o.ClassName == 'TextBox' then
+        local ph = tostring(rawget(o, 'PlaceholderText') or '')
+        if ph == 'ACCESS-KEY' or BASE_STRING.upper(ph):find('KEY', 1, true) then box = o end
     end
-  end
+end
+for _, sig in BASE_IPAIRS(SIGNALS) do
+    local owner = sig.owner
+    if owner and owner.ClassName == 'TextButton' and BASE_STRING.upper(tostring(rawget(owner, 'Text') or '')) == 'UNLOCK' then
+        unlockSignals[#unlockSignals + 1] = sig
+    end
 end
 
-out('=== CALLBACK UPVALUES ===')
-for _,sig in ipairs(SIGNALS) do
-  for idx,fn in ipairs(sig.connections) do
-    local owner=sig.owner
-    local txt=owner and rawget(owner,'Text') or nil
-    out('[SIGNAL]',simple(owner),sig.name,'Text='..simple(txt),'#'..idx)
-    seen={}; dumpValue(fn,0,'callback')
-  end
+-- Runtime wrappers are installed only AFTER initialization, so the anti-tamper bootstrap
+-- sees the original standard-library functions. They log any key table/normalization used
+-- while the UNLOCK callback executes.
+local function dumpSmallTable(t, tag)
+    if type(t) ~= 'table' then return end
+    local parts = {}
+    local n = 0
+    for k, v in BASE_PAIRS(t) do
+        n += 1
+        if n > 40 then break end
+        if type(k) == 'string' or type(k) == 'number' then
+            if type(v) == 'string' or type(v) == 'number' or type(v) == 'boolean' then
+                parts[#parts + 1] = '[' .. simple(k) .. ']=' .. simple(v)
+            end
+        end
+    end
+    if #parts > 0 then out(tag, table.concat(parts, ' | ')) end
 end
 
--- Invoke only the visible UNLOCK callback with a sentinel to log runtime transforms.
-local box=nil
-local unlockSignal=nil
-for _,o in ipairs(ALL) do
-  if o.ClassName=='TextBox' and (rawget(o,'PlaceholderText')=='ACCESS-KEY' or tostring(rawget(o,'PlaceholderText')):find('KEY')) then box=o end
+pairs = function(t)
+    dumpSmallTable(t, '[PAIRS-TABLE]')
+    return BASE_PAIRS(t)
 end
-for _,sig in ipairs(SIGNALS) do
-  local owner=sig.owner
-  if owner and owner.ClassName=='TextButton' and tostring(rawget(owner,'Text')):upper()=='UNLOCK' then unlockSignal=sig break end
+ipairs = function(t)
+    dumpSmallTable(t, '[IPAIRS-TABLE]')
+    return BASE_IPAIRS(t)
 end
-if box and unlockSignal then
-  box.Text='__TRACE_SENTINEL_9F3A__'
-  out('=== INVOKE UNLOCK WITH SENTINEL ===')
-  unlockSignal:Fire()
+
+local TRACE_STRING = {}
+for k, v in BASE_PAIRS(BASE_STRING) do TRACE_STRING[k] = v end
+TRACE_STRING.upper = function(s)
+    local r = BASE_STRING.upper(s)
+    out('[STRING.UPPER]', simple(s), '->', simple(r))
+    return r
+end
+TRACE_STRING.match = function(s, p, ...)
+    local r = BASE_STRING.match(s, p, ...)
+    out('[STRING.MATCH]', simple(s), simple(p), '->', simple(r))
+    return r
+end
+TRACE_STRING.gsub = function(s, p, r, n)
+    local a, b = BASE_STRING.gsub(s, p, r, n)
+    out('[STRING.GSUB]', simple(s), simple(p), '->', simple(a))
+    return a, b
+end
+string = TRACE_STRING
+
+local BASE_TONUMBER = tonumber
+tonumber = function(v, ...)
+    local r = BASE_TONUMBER(v, ...)
+    out('[TONUMBER]', simple(v), '->', simple(r))
+    return r
+end
+
+if box and #unlockSignals > 0 then
+    box.Text = '__TRACE_SENTINEL_9F3A__'
+    out('=== INVOKE UNLOCK WITH SENTINEL ===')
+    for _, sig in BASE_IPAIRS(unlockSignals) do sig:Fire() end
 else
-  out('[WARN] unlock gate not found for invocation')
+    out('[WARN] unlock gate not found for invocation', 'box=' .. tostring(box), 'signals=' .. tostring(#unlockSignals))
 end
 
+out('=== POST-CALL UI ===')
+for i, o in BASE_IPAIRS(ALL) do
+    if o.ClassName == 'TextLabel' or o.ClassName == 'TextButton' or o.ClassName == 'TextBox' or o.ClassName == 'ScreenGui' then
+        out('[UI-AFTER]', i, o.ClassName, 'Name=' .. tostring(o.Name), 'Text=' .. simple(rawget(o, 'Text')), 'Destroyed=' .. tostring(rawget(o, 'Destroyed')))
+    end
+end
 out('=== DONE ===')
