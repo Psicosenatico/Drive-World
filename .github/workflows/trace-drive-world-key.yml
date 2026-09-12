@@ -15,19 +15,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Lua 5.1
+      - name: Build Luau CLI
         run: |
-          sudo apt-get update
-          sudo apt-get install -y lua5.1
-          lua5.1 -v
+          git clone --depth 1 https://github.com/luau-lang/luau.git /tmp/luau
+          cmake -S /tmp/luau -B /tmp/luau/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/luau/build --target Luau.Repl.CLI -j2
+          /tmp/luau/build/luau --version || true
       - name: Fetch original loader
         run: |
           curl -fsSL 'https://raw.githubusercontent.com/yumyum272/driving/refs/heads/main/script.lua' -o script.lua
           wc -c script.lua
           sha1sum script.lua
+      - name: Build injected trace runner
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          harness=Path('Tools/trace_script_lua.lua').read_text()
+          src=Path('script.lua').read_text()
+          marker='__TARGET_EXEC__'
+          assert marker in harness
+          # Long bracket delimiter chosen so raw source is embedded byte-for-byte.
+          eq='===='
+          assert ']' + eq + ']' not in src
+          injected=("local __src = ["+eq+"["+src+"]"+eq+"]\n"
+                    "local __chunk, __compileErr = loadstring(__src, '@script.lua')\n"
+                    "if __chunk then ok, err = pcall(__chunk) else ok=false; err=__compileErr end")
+          Path('trace_runner.luau').write_text(harness.replace(marker,injected))
+          PY
       - name: Trace gate callbacks
         run: |
-          lua5.1 Tools/trace_script_lua.lua | tee trace_key.log
+          /tmp/luau/build/luau trace_runner.luau | tee trace_key.log
       - uses: actions/upload-artifact@v4
         with:
           name: drive-world-key-trace
