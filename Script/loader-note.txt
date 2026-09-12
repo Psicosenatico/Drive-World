@@ -1,0 +1,1 @@
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Psicosenatico/Drive-World/main/Script/main.lua"))()
