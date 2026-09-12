@@ -20,7 +20,6 @@ jobs:
           git clone --depth 1 https://github.com/luau-lang/luau.git /tmp/luau
           cmake -S /tmp/luau -B /tmp/luau/build -DCMAKE_BUILD_TYPE=Release
           cmake --build /tmp/luau/build --target Luau.Repl.CLI -j2
-          /tmp/luau/build/luau --version || true
       - name: Fetch original loader
         run: |
           curl -fsSL 'https://raw.githubusercontent.com/yumyum272/driving/refs/heads/main/script.lua' -o script.lua
@@ -32,15 +31,14 @@ jobs:
           from pathlib import Path
           harness=Path('Tools/trace_script_lua.lua').read_text()
           src=Path('script.lua').read_text()
-          marker='__TARGET_EXEC__'
+          marker='\n__TARGET_EXEC__\n'
           assert marker in harness
-          # Long bracket delimiter chosen so raw source is embedded byte-for-byte.
           eq='===='
           assert ']' + eq + ']' not in src
-          injected=("local __src = ["+eq+"["+src+"]"+eq+"]\n"
+          injected=("\nlocal __src = ["+eq+"["+src+"]"+eq+"]\n"
                     "local __chunk, __compileErr = loadstring(__src, '@script.lua')\n"
-                    "if __chunk then ok, err = pcall(__chunk) else ok=false; err=__compileErr end")
-          Path('trace_runner.luau').write_text(harness.replace(marker,injected))
+                    "if __chunk then ok, err = pcall(__chunk) else ok=false; err=__compileErr end\n")
+          Path('trace_runner.luau').write_text(harness.replace(marker,injected,1))
           PY
       - name: Trace gate callbacks
         run: |
