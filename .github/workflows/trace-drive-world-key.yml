@@ -19,7 +19,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/luau-lang/luau.git /tmp/luau
           cmake -S /tmp/luau -B /tmp/luau/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/luau/build --target Luau.Repl.CLI -j2
+          cmake --build /tmp/luau/build --target Luau.Repl.CLI -j4
       - name: Fetch original loader
         run: |
           curl -fsSL 'https://raw.githubusercontent.com/yumyum272/driving/refs/heads/main/script.lua' -o script.lua
@@ -35,7 +35,34 @@ jobs:
           assert marker in harness
           eq='===='
           assert ']' + eq + ']' not in src
-          injected=("\nlocal __src = ["+eq+"["+src+"]"+eq+"]\n"
+          instrumentation=r'''
+local __baseSetmetatable = setmetatable
+local __instrumentedIndex = {}
+setmetatable = function(t, mt)
+    if type(mt) == 'table' then
+        local idx = rawget(mt, '__index')
+        if type(idx) == 'table' and not __instrumentedIndex[idx] then
+            local empty = next(idx) == nil
+            if empty then
+                __instrumentedIndex[idx] = true
+                local backing = {}
+                __baseSetmetatable(idx, {
+                    __index = backing,
+                    __newindex = function(_, k, v)
+                        backing[k] = v
+                        if type(v) == 'string' and v ~= '' then
+                            out('[DECRYPTED-CACHE]', simple(k), simple(v))
+                        end
+                    end,
+                })
+            end
+        end
+    end
+    return __baseSetmetatable(t, mt)
+end
+'''
+          injected=("\n"+instrumentation+
+                    "local __src = ["+eq+"["+src+"]"+eq+"]\n"
                     "local __chunk, __compileErr = loadstring(__src, '@script.lua')\n"
                     "if __chunk then ok, err = pcall(__chunk) else ok=false; err=__compileErr end\n")
           Path('trace_runner.luau').write_text(harness.replace(marker,injected,1))
