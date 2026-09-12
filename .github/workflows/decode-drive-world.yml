@@ -1,0 +1,29 @@
+name: Decode Drive World loader
+
+on:
+  push:
+    paths:
+      - 'Tools/decode_script_lua.py'
+      - '.github/workflows/decode-drive-world.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Decode first layer
+        run: |
+          python Tools/decode_script_lua.py
+          echo '--- decoded strings ---'
+          cat script_lua_decoded_strings.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drive-world-decoded-strings
+          path: script_lua_decoded_strings.txt
