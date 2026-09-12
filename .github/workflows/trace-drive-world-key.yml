@@ -35,32 +35,30 @@ jobs:
           assert marker in harness
           eq='===='
           assert ']' + eq + ']' not in src
-          instrumentation=r'''
-local __baseSetmetatable = setmetatable
-local __instrumentedIndex = {}
-setmetatable = function(t, mt)
-    if type(mt) == 'table' then
-        local idx = rawget(mt, '__index')
-        if type(idx) == 'table' and not __instrumentedIndex[idx] then
-            local empty = next(idx) == nil
-            if empty then
-                __instrumentedIndex[idx] = true
-                local backing = {}
-                __baseSetmetatable(idx, {
-                    __index = backing,
-                    __newindex = function(_, k, v)
-                        backing[k] = v
-                        if type(v) == 'string' and v ~= '' then
-                            out('[DECRYPTED-CACHE]', simple(k), simple(v))
-                        end
-                    end,
-                })
-            end
-        end
-    end
-    return __baseSetmetatable(t, mt)
-end
-'''
+          lines = [
+              "local __baseSetmetatable = setmetatable",
+              "local __instrumentedIndex = {}",
+              "setmetatable = function(t, mt)",
+              "    if type(mt) == 'table' then",
+              "        local idx = rawget(mt, '__index')",
+              "        if type(idx) == 'table' and not __instrumentedIndex[idx] and next(idx) == nil then",
+              "            __instrumentedIndex[idx] = true",
+              "            local backing = {}",
+              "            __baseSetmetatable(idx, {",
+              "                __index = backing,",
+              "                __newindex = function(_, k, v)",
+              "                    backing[k] = v",
+              "                    if type(v) == 'string' and v ~= '' then",
+              "                        out('[DECRYPTED-CACHE]', simple(k), simple(v))",
+              "                    end",
+              "                end,",
+              "            })",
+              "        end",
+              "    end",
+              "    return __baseSetmetatable(t, mt)",
+              "end",
+          ]
+          instrumentation='\n'.join(lines)+'\n'
           injected=("\n"+instrumentation+
                     "local __src = ["+eq+"["+src+"]"+eq+"]\n"
                     "local __chunk, __compileErr = loadstring(__src, '@script.lua')\n"
