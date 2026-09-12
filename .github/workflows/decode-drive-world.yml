@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'Tools/decode_script_lua.py'
+      - 'Tools/probe_second_layer.py'
       - '.github/workflows/decode-drive-world.yml'
   workflow_dispatch:
 
@@ -21,9 +22,12 @@ jobs:
       - name: Decode first layer
         run: |
           python Tools/decode_script_lua.py
-          echo '--- decoded strings ---'
-          cat script_lua_decoded_strings.txt
+      - name: Probe second layer
+        run: |
+          python Tools/probe_second_layer.py | tee second_layer_probe.log
       - uses: actions/upload-artifact@v4
         with:
-          name: drive-world-decoded-strings
-          path: script_lua_decoded_strings.txt
+          name: drive-world-static-analysis
+          path: |
+            script_lua_decoded_strings.txt
+            second_layer_probe.log
