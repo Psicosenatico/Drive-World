@@ -1,7 +1,7 @@
 -- ExactKeyMemoryScanner.lua
--- V3 - scanner somente leitura para localizar a chave EXATA embutida no gate SCRIPT ACCESS.
--- NAO preenche o TextBox, NAO clica UNLOCK e NAO consome tentativa.
--- Fluxo: callback direto do botao -> funcoes marcadas -> fallback amplo controlado.
+-- V4 - scanner somente leitura do callback real do UNLOCK.
+-- NAO preenche a chave, NAO clica UNLOCK e NAO consome tentativas.
+-- Objetivo: reconstruir a estrutura da closure/VM e exportar strings BINARIAS com HEX exato.
 
 local G = (getgenv and getgenv()) or _G
 
@@ -9,89 +9,47 @@ if type(G.EXACT_KEY_MEMORY_STOP) == "function" then
     pcall(G.EXACT_KEY_MEMORY_STOP, true)
 end
 
-local rows = {}
-local hits = {}
-local seen = {}
-local inspectedFunctions = {}
-local selfFunctions = {}
-local stopRequested = false
 local running = false
+local stopped = false
 local finished = false
-local ui, statusLabel, startButton, stopButton
-local scannedGC = 0
-local callbackCount = 0
-local markerFunctionCount = 0
 local startedAt = 0
+local ui, statusLabel, startButton, stopButton
+local connections = {}
 
 local function safe(v)
-    local ok, s = pcall(tostring, v)
-    return ok and s or "<tostring error>"
+    local ok, r = pcall(tostring, v)
+    return ok and r or "<tostring error>"
 end
 
-local function log(s)
-    s = tostring(s)
-    rows[#rows + 1] = s
-    print("[KEY-MEM-V3] " .. s)
+local function typeofSafe(v)
+    local ok, r = pcall(function()
+        if typeof then return typeof(v) end
+        return type(v)
+    end)
+    return ok and r or type(v)
 end
 
 local function setStatus(text)
     if statusLabel then
         pcall(function() statusLabel.Text = tostring(text) end)
     end
+    print("[KEY-MEM-V4] " .. tostring(text))
 end
 
-local noise = {
-    ["script access"] = true,
-    ["enter your access key to continue"] = true,
-    ["access-key"] = true,
-    ["get key"] = true,
-    ["unlock"] = true,
-    ["unlocked"] = true,
-    ["that key is not valid."] = true,
-    ["that key is not valid"] = true,
-    ["access granted."] = true,
-    ["access granted"] = true,
-    ["copied to clipboard."] = true,
-    ["mousebutton1click"] = true,
-    ["activated"] = true,
-    ["textbutton"] = true,
-    ["textbox"] = true,
-}
-
-local function looksInterestingString(value)
-    if type(value) ~= "string" then return false end
-    if #value < 3 or #value > 160 then return false end
-    local low = value:lower()
-    if noise[low] then return false end
-    if low:match("^https?://") then return false end
-    if low:find("rbxasset", 1, true) then return false end
-    if low:find("enum.", 1, true) then return false end
-    return true
+local function addConn(c)
+    connections[#connections + 1] = c
+    return c
 end
 
-local function add(value, origin, score)
-    if not looksInterestingString(value) then return end
-
-    score = score or 0
-    if value:match("^[%w%._%-]+$") then score = score + 2 end
-    if value:match("%u") and value:match("%d") then score = score + 3 end
-    if value:find("-", 1, true) then score = score + 2 end
-    if #value >= 6 and #value <= 64 then score = score + 2 end
-    if value:lower():find("key", 1, true) then score = score + 3 end
-
-    hits[#hits + 1] = {
-        value = value,
-        origin = origin,
-        score = score,
-    }
+local function disconnectAll()
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    connections = {}
 end
 
 local function getConstants(fn)
-    local funcs = {
-        rawget(G, "getconstants"),
-        debug and debug.getconstants,
-    }
-    for _, f in ipairs(funcs) do
+    for _, f in ipairs({rawget(G, "getconstants"), debug and debug.getconstants}) do
         if type(f) == "function" then
             local ok, r = pcall(f, fn)
             if ok and type(r) == "table" then return r end
@@ -100,11 +58,7 @@ local function getConstants(fn)
 end
 
 local function getUpvalues(fn)
-    local funcs = {
-        rawget(G, "getupvalues"),
-        debug and debug.getupvalues,
-    }
-    for _, f in ipairs(funcs) do
+    for _, f in ipairs({rawget(G, "getupvalues"), debug and debug.getupvalues}) do
         if type(f) == "function" then
             local ok, r = pcall(f, fn)
             if ok and type(r) == "table" then return r end
@@ -113,11 +67,7 @@ local function getUpvalues(fn)
 end
 
 local function getProtos(fn)
-    local funcs = {
-        rawget(G, "getprotos"),
-        debug and debug.getprotos,
-    }
-    for _, f in ipairs(funcs) do
+    for _, f in ipairs({rawget(G, "getprotos"), debug and debug.getprotos}) do
         if type(f) == "function" then
             local ok, r = pcall(f, fn)
             if ok and type(r) == "table" then return r end
@@ -125,141 +75,62 @@ local function getProtos(fn)
     end
 end
 
-local inspectValue
-local inspectFunction
-
-local function markerScoreFromConstants(c)
-    if type(c) ~= "table" then return 0 end
-    local score = 0
-    for _, v in pairs(c) do
-        if type(v) == "string" then
-            local l = v:lower()
-            if l:find("that key is not valid", 1, true) then score = score + 30 end
-            if l:find("access granted", 1, true) then score = score + 30 end
-            if l == "unlock" then score = score + 12 end
-            if l == "access-key" then score = score + 12 end
-            if l:find("attempt", 1, true) then score = score + 6 end
-        end
+local function byteHex(s)
+    if type(s) ~= "string" then return "" end
+    local t = table.create and table.create(#s) or {}
+    for i = 1, #s do
+        t[i] = string.format("%02X", string.byte(s, i))
     end
-    return score
+    return table.concat(t)
 end
 
-inspectValue = function(v, origin, depth, inheritedScore)
-    if stopRequested then return end
-    depth = depth or 0
-    inheritedScore = inheritedScore or 0
-    if depth > 8 then return end
-
-    if type(v) == "string" then
-        add(v, origin, inheritedScore)
-        return
+local function escapedAscii(s)
+    if type(s) ~= "string" then return safe(s) end
+    local out = {}
+    for i = 1, #s do
+        local b = string.byte(s, i)
+        if b == 92 then
+            out[#out + 1] = "\\\\"
+        elseif b == 34 then
+            out[#out + 1] = "\\\""
+        elseif b >= 32 and b <= 126 then
+            out[#out + 1] = string.char(b)
+        else
+            out[#out + 1] = string.format("\\x%02X", b)
+        end
     end
+    return table.concat(out)
+end
 
-    if type(v) == "function" then
-        inspectFunction(v, origin, depth + 1, inheritedScore)
-        return
-    end
-
-    if type(v) ~= "table" or seen[v] then return end
-    seen[v] = true
-
+local function printableRatio(s)
+    if type(s) ~= "string" or #s == 0 then return 0 end
     local n = 0
-    for k, val in pairs(v) do
-        if stopRequested then return end
-        n = n + 1
-        if n > 800 then break end
-
-        if type(k) == "string" then
-            local lk = k:lower()
-            if val == true then
-                add(k, origin .. "[key=true]", inheritedScore + 35)
-            elseif type(val) == "string" and (
-                lk:find("key", 1, true)
-                or lk:find("pass", 1, true)
-                or lk:find("access", 1, true)
-                or lk:find("code", 1, true)
-            ) then
-                add(val, origin .. "[" .. k .. "]", inheritedScore + 35)
-            end
-        end
-
-        if type(val) == "string" then
-            add(val, origin .. "[value]", inheritedScore)
-        elseif type(val) == "table" or type(val) == "function" then
-            inspectValue(val, origin .. "[" .. safe(k) .. "]", depth + 1, inheritedScore)
-        end
+    for i = 1, #s do
+        local b = string.byte(s, i)
+        if b >= 32 and b <= 126 then n = n + 1 end
     end
-end
-
-inspectFunction = function(fn, origin, depth, inheritedScore)
-    if stopRequested then return end
-    if type(fn) ~= "function" or inspectedFunctions[fn] or selfFunctions[fn] then return end
-    depth = depth or 0
-    inheritedScore = inheritedScore or 0
-    if depth > 8 then return end
-
-    inspectedFunctions[fn] = true
-
-    local consts = getConstants(fn)
-    local markerScore = markerScoreFromConstants(consts)
-    local score = inheritedScore + markerScore
-
-    if markerScore > 0 then
-        markerFunctionCount = markerFunctionCount + 1
-    end
-
-    if consts then
-        for i, v in pairs(consts) do
-            if type(v) == "string" then
-                add(v, origin .. ".const[" .. tostring(i) .. "]", score + (markerScore > 0 and 10 or 0))
-            elseif type(v) == "table" then
-                inspectValue(v, origin .. ".const[" .. tostring(i) .. "]", depth + 1, score)
-            end
-        end
-    end
-
-    local ups = getUpvalues(fn)
-    if ups then
-        for k, v in pairs(ups) do
-            if type(v) == "string" then
-                add(v, origin .. ".upvalue[" .. safe(k) .. "]", score + 18)
-            elseif type(v) == "table" or type(v) == "function" then
-                inspectValue(v, origin .. ".upvalue[" .. safe(k) .. "]", depth + 1, score + 12)
-            end
-        end
-    end
-
-    local protos = getProtos(fn)
-    if protos then
-        for i, p in pairs(protos) do
-            if type(p) == "function" then
-                inspectFunction(p, origin .. ".proto[" .. tostring(i) .. "]", depth + 1, score + 8)
-            end
-        end
-    end
+    return n / #s
 end
 
 local function roots()
-    local list = {}
-    pcall(function()
-        list[#list + 1] = game:GetService("CoreGui")
-    end)
+    local out = {}
+    pcall(function() out[#out + 1] = game:GetService("CoreGui") end)
     pcall(function()
         local plr = game:GetService("Players").LocalPlayer
         if plr then
             local pg = plr:FindFirstChildOfClass("PlayerGui")
-            if pg then list[#list + 1] = pg end
+            if pg then out[#out + 1] = pg end
         end
     end)
-    return list
+    return out
 end
 
 local function findGate()
     for _, root in ipairs(roots()) do
-        local ok, descendants = pcall(function() return root:GetDescendants() end)
-        if ok and type(descendants) == "table" then
-            local box, button, screen
-            for _, obj in ipairs(descendants) do
+        local ok, desc = pcall(function() return root:GetDescendants() end)
+        if ok and type(desc) == "table" then
+            local screen, box, button, status
+            for _, obj in ipairs(desc) do
                 pcall(function()
                     if obj:IsA("TextBox") then
                         local ph = tostring(obj.PlaceholderText or "")
@@ -267,251 +138,363 @@ local function findGate()
                             box = box or obj
                         end
                     elseif obj:IsA("TextButton") then
-                        local text = tostring(obj.Text or "")
-                        if text:upper() == "UNLOCK" or text:lower():find("confirm", 1, true) then
+                        local tx = tostring(obj.Text or "")
+                        if tx:upper() == "UNLOCK" or tx:lower():find("confirm", 1, true) then
                             button = button or obj
                         end
+                    elseif obj:IsA("TextLabel") then
+                        local tx = tostring(obj.Text or ""):lower()
+                        if tx:find("key is not valid", 1, true)
+                        or tx:find("access granted", 1, true)
+                        or tx:find("copied to clipboard", 1, true) then
+                            status = status or obj
+                        end
                     elseif obj:IsA("ScreenGui") then
-                        local n = tostring(obj.Name or "")
-                        if n:lower():find("key", 1, true) or n:lower():find("loader", 1, true) then
+                        local n = tostring(obj.Name or ""):lower()
+                        if n:find("key", 1, true) or n:find("loader", 1, true) then
                             screen = screen or obj
                         end
                     end
                 end)
             end
-            if box and button then return screen, box, button end
+            if box and button then return screen, box, button, status end
         end
     end
 end
 
-local function inspectSignal(signal, label)
-    if type(getconnections) ~= "function" then return 0 end
-    local ok, cons = pcall(getconnections, signal)
-    if not ok or type(cons) ~= "table" then return 0 end
-
-    local found = 0
-    for i, c in ipairs(cons) do
-        if stopRequested then break end
-        local fn
-        pcall(function() fn = c.Function end)
-        if type(fn) == "function" and not selfFunctions[fn] then
-            found = found + 1
-            callbackCount = callbackCount + 1
-            inspectFunction(fn, "UNLOCK." .. label .. ".connection[" .. tostring(i) .. "]", 0, 55)
-        end
-    end
-    return found
-end
-
-local function phaseCallback()
-    setStatus("Etapa 1/3: callback do UNLOCK")
-    local screen, box, button = findGate()
-    if not box or not button then
-        log("Gate ACCESS-KEY/UNLOCK nao encontrado na interface.")
-        return false
-    end
-
-    log("Gate encontrado: " .. safe(screen or button))
-    log("Botao UNLOCK: " .. safe(button))
-
-    local found = 0
-    pcall(function() found = found + inspectSignal(button.MouseButton1Click, "MouseButton1Click") end)
-    pcall(function() found = found + inspectSignal(button.Activated, "Activated") end)
-
-    log("Callbacks acessiveis no UNLOCK: " .. tostring(found))
-    return found > 0
-end
-
-local function phaseMarkedGC(gc)
-    setStatus("Etapa 2/3: validator na memoria")
-    for i, obj in ipairs(gc) do
-        if stopRequested then return end
-        if type(obj) == "function" and not selfFunctions[obj] then
-            local c = getConstants(obj)
-            if markerScoreFromConstants(c) > 0 then
-                inspectFunction(obj, "gc-marker[" .. tostring(i) .. "]", 0, 45)
-            end
-        end
-        if i % 700 == 0 then
-            setStatus("Etapa 2/3: " .. tostring(i) .. "/" .. tostring(#gc))
-            task.wait()
-        end
-    end
-end
-
-local function phaseFallback(gc)
-    -- So entra se as fases focadas nao produziram candidatos fortes.
-    setStatus("Etapa 3/3: fallback seguro")
-    for i, obj in ipairs(gc) do
-        if stopRequested then return end
-        if type(obj) == "function" and not selfFunctions[obj] then
-            local ups = getUpvalues(obj)
-            if ups then
-                for k, v in pairs(ups) do
-                    if type(v) == "string" then
-                        add(v, "fallback.gc[" .. tostring(i) .. "].upvalue[" .. safe(k) .. "]", 3)
-                    elseif type(v) == "table" then
-                        -- Profundidade menor no fallback para evitar varrer o jogo inteiro.
-                        local oldSeen = seen[v]
-                        if not oldSeen then
-                            inspectValue(v, "fallback.gc[" .. tostring(i) .. "].upvalue[" .. safe(k) .. "]", 5, 1)
-                        end
-                    end
-                end
-            end
-        end
-        if i % 700 == 0 then
-            setStatus("Etapa 3/3: " .. tostring(i) .. "/" .. tostring(#gc))
-            task.wait()
-        end
-    end
-end
-
-local function buildResult()
-    local best = {}
-    for _, h in ipairs(hits) do
-        local old = best[h.value]
-        if not old or h.score > old.score then
-            best[h.value] = h
-        end
-    end
-
+local function getUnlockCallbacks(button)
     local list = {}
-    for _, h in pairs(best) do list[#list + 1] = h end
-    table.sort(list, function(a, b)
-        if a.score == b.score then
-            if #a.value == #b.value then return a.value < b.value end
-            return #a.value < #b.value
+    if type(getconnections) ~= "function" then return list end
+
+    local function collect(signal, label)
+        local ok, cons = pcall(getconnections, signal)
+        if not ok or type(cons) ~= "table" then return end
+        for i, c in ipairs(cons) do
+            local fn
+            pcall(function() fn = c.Function end)
+            if type(fn) == "function" then
+                list[#list + 1] = {
+                    fn = fn,
+                    path = "UNLOCK." .. label .. ".connection[" .. tostring(i) .. "]"
+                }
+            end
         end
-        return a.score > b.score
-    end)
+    end
+
+    pcall(function() collect(button.MouseButton1Click, "MouseButton1Click") end)
+    pcall(function() collect(button.Activated, "Activated") end)
     return list
 end
 
-local function saveReport(stateText)
-    local result = buildResult()
-    local finalRows = {}
-    finalRows[#finalRows + 1] = "Estado: " .. tostring(stateText)
-    finalRows[#finalRows + 1] = "Objetos GC verificados: " .. tostring(scannedGC)
-    finalRows[#finalRows + 1] = "Callbacks UNLOCK acessiveis: " .. tostring(callbackCount)
-    finalRows[#finalRows + 1] = "Funcoes validator marcadas: " .. tostring(markerFunctionCount)
-    finalRows[#finalRows + 1] = string.format("Tempo: %.2fs", startedAt > 0 and (os.clock() - startedAt) or 0)
-    finalRows[#finalRows + 1] = ""
-    finalRows[#finalRows + 1] = "========== CANDIDATOS =========="
-
-    for i, h in ipairs(result) do
-        if i > 180 then break end
-        finalRows[#finalRows + 1] = string.format(
-            "[%03d] score=%d | %q | %s",
-            i,
-            h.score,
-            h.value,
-            h.origin
-        )
+local function tableStats(t)
+    local total, strings, funcs, tables, instances = 0, 0, 0, 0, 0
+    for _, v in pairs(t) do
+        total = total + 1
+        local tp = typeofSafe(v)
+        if type(v) == "string" then strings = strings + 1
+        elseif type(v) == "function" then funcs = funcs + 1
+        elseif type(v) == "table" then tables = tables + 1
+        elseif tp == "Instance" then instances = instances + 1 end
+        if total >= 5000 then break end
     end
+    return total, strings, funcs, tables, instances
+end
 
-    if #result == 0 then
-        finalRows[#finalRows + 1] = "<nenhum candidato recuperado>"
+local function keyLabel(k)
+    if type(k) == "number" then return "[" .. tostring(k) .. "]" end
+    if type(k) == "string" then return "[\"" .. escapedAscii(k) .. "\"]" end
+    return "[" .. safe(k) .. "]"
+end
+
+local function valueSummary(v)
+    local tp = typeofSafe(v)
+    if type(v) == "string" then
+        return string.format("string len=%d ascii=\"%s\" hex=%s", #v, escapedAscii(v), byteHex(v))
+    elseif tp == "Instance" then
+        local class, name, full = "?", "?", "?"
+        pcall(function() class = v.ClassName end)
+        pcall(function() name = v.Name end)
+        pcall(function() full = v:GetFullName() end)
+        return string.format("Instance class=%s name=%s path=%s", safe(class), safe(name), safe(full))
+    elseif type(v) == "number" or type(v) == "boolean" or type(v) == "nil" then
+        return type(v) .. "=" .. safe(v)
+    elseif type(v) == "function" then
+        return "function=" .. safe(v)
+    elseif type(v) == "table" then
+        local a,b,c,d,e = tableStats(v)
+        return string.format("table=%s total=%d strings=%d functions=%d tables=%d instances=%d", safe(v), a,b,c,d,e)
     end
-
-    local report = table.concat(finalRows, "\n")
-    G.EXACT_KEY_MEMORY_RESULTS = result
-    G.EXACT_KEY_MEMORY_REPORT = report
-
-    local filename = "ExactKeyMemory_" .. tostring(os.time()) .. ".txt"
-    if type(writefile) == "function" then
-        local ok = pcall(writefile, filename, report)
-        if ok then log("Relatorio salvo em: " .. filename) end
-    end
-    return report, result
+    return tp .. "=" .. safe(v)
 end
 
 local function runScan()
     if running or finished then return end
     running = true
-    stopRequested = false
+    stopped = false
     startedAt = os.clock()
-    rows = {}
-    hits = {}
-    seen = {}
-    inspectedFunctions = {}
-    callbackCount = 0
-    markerFunctionCount = 0
 
-    setStatus("Iniciando...")
-    log("Scanner V3 iniciado em modo somente leitura.")
-
-    if type(getgc) ~= "function" then
-        log("ERRO: executor nao possui getgc().")
-        setStatus("Erro: getgc indisponivel")
+    setStatus("Procurando gate...")
+    local screen, box, button, status = findGate()
+    if not box or not button then
+        setStatus("Gate ACCESS-KEY / UNLOCK não encontrado")
         running = false
         return
     end
 
-    -- Etapa 1: callback real do botao, sem dispara-lo.
-    phaseCallback()
-
-    if stopRequested then
-        saveReport("scan interrompido")
-        setStatus("Interrompido")
-        running = false
-        finished = true
-        return
-    end
-
-    local ok, gc = pcall(getgc, true)
-    if not ok or type(gc) ~= "table" then
-        log("ERRO: getgc(true) falhou.")
-        setStatus("Erro em getgc")
+    setStatus("Lendo callback do UNLOCK...")
+    local callbacks = getUnlockCallbacks(button)
+    if #callbacks == 0 then
+        setStatus("Nenhum callback acessível")
         running = false
         return
     end
-    scannedGC = #gc
 
-    -- Etapa 2: somente funcoes contendo textos do validator.
-    phaseMarkedGC(gc)
+    local report = {}
+    local function push(s) report[#report + 1] = tostring(s) end
 
-    local interim = buildResult()
-    local strongest = interim[1] and interim[1].score or 0
+    push("ExactKeyMemoryScanner V4")
+    push("Modo: SOMENTE LEITURA")
+    push("Tempo inicial: " .. tostring(os.time()))
+    push("Callbacks UNLOCK acessíveis: " .. tostring(#callbacks))
+    push("TextBox: " .. safe(box))
+    push("UNLOCK: " .. safe(button))
+    push("Status: " .. safe(status))
+    push("")
 
-    -- Etapa 3: fallback apenas se ainda nao recuperamos algo convincente.
-    if not stopRequested and strongest < 35 then
-        phaseFallback(gc)
+    local seenF, seenT = {}, {}
+    local largeTables = {}
+    local uiTables = {}
+    local functionPaths = {}
+
+    local function registerLargeTable(t, path)
+        local total, strings, funcs, tables, instances = tableStats(t)
+        if strings >= 12 then
+            largeTables[#largeTables + 1] = {
+                t=t, path=path, total=total, strings=strings, funcs=funcs, tables=tables, instances=instances
+            }
+        end
     end
 
-    local state = stopRequested and "scan interrompido" or "scan concluido"
-    local _, result = saveReport(state)
+    local function tableHasUI(t)
+        local found = false
+        local names = {}
+        for k,v in pairs(t) do
+            if v == box then found = true; names[#names+1] = keyLabel(k) .. "=TEXTBOX" end
+            if v == button then found = true; names[#names+1] = keyLabel(k) .. "=UNLOCK" end
+            if screen and v == screen then found = true; names[#names+1] = keyLabel(k) .. "=SCREEN" end
+            if status and v == status then found = true; names[#names+1] = keyLabel(k) .. "=STATUS" end
+        end
+        return found, table.concat(names, ", ")
+    end
 
-    if stopRequested then
-        setStatus("Interrompido - toque FINALIZAR")
-    elseif #result == 0 then
-        setStatus("Concluido: 0 candidatos")
+    local inspectFunction, inspectValue
+
+    inspectValue = function(v, path, depth)
+        if stopped or depth > 9 then return end
+        if type(v) == "function" then
+            inspectFunction(v, path, depth + 1)
+            return
+        end
+        if type(v) ~= "table" then return end
+        if seenT[v] then return end
+        seenT[v] = true
+
+        registerLargeTable(v, path)
+        local hasUI, which = tableHasUI(v)
+        if hasUI then
+            uiTables[#uiTables + 1] = {t=v, path=path, which=which}
+        end
+
+        local n = 0
+        for k,val in pairs(v) do
+            if stopped then return end
+            n = n + 1
+            if n > 1500 then break end
+            if type(val) == "function" or type(val) == "table" then
+                inspectValue(val, path .. keyLabel(k), depth + 1)
+            end
+        end
+    end
+
+    inspectFunction = function(fn, path, depth)
+        if stopped or depth > 9 then return end
+        if type(fn) ~= "function" or seenF[fn] then return end
+        seenF[fn] = true
+        functionPaths[#functionPaths + 1] = path
+
+        local ups = getUpvalues(fn)
+        if ups then
+            for k,v in pairs(ups) do
+                if type(v) == "function" or type(v) == "table" then
+                    inspectValue(v, path .. ".upvalue[" .. safe(k) .. "]", depth + 1)
+                end
+            end
+        end
+
+        local protos = getProtos(fn)
+        if protos then
+            for i,p in pairs(protos) do
+                if type(p) == "function" then
+                    inspectFunction(p, path .. ".proto[" .. tostring(i) .. "]", depth + 1)
+                end
+            end
+        end
+    end
+
+    for i, item in ipairs(callbacks) do
+        if stopped then break end
+        setStatus("Mapeando callback " .. tostring(i) .. "/" .. tostring(#callbacks))
+        inspectFunction(item.fn, item.path, 0)
+        task.wait()
+    end
+
+    push("========== ESTRUTURA ==========")
+    push("Funções alcançadas: " .. tostring(#functionPaths))
+    push("Tabelas grandes de strings: " .. tostring(#largeTables))
+    push("Tabelas contendo referências da UI: " .. tostring(#uiTables))
+    push("")
+
+    push("========== UPVALUES DIRETOS DOS CALLBACKS ==========")
+    for _, item in ipairs(callbacks) do
+        push("CALLBACK " .. item.path)
+        local ups = getUpvalues(item.fn)
+        if ups then
+            local keys = {}
+            for k in pairs(ups) do keys[#keys+1] = k end
+            table.sort(keys, function(a,b) return tostring(a) < tostring(b) end)
+            for _,k in ipairs(keys) do
+                push("  upvalue[" .. safe(k) .. "] => " .. valueSummary(ups[k]))
+            end
+        else
+            push("  <upvalues indisponíveis>")
+        end
+    end
+    push("")
+
+    push("========== TABELAS COM REFERÊNCIAS DA UI ==========")
+    if #uiTables == 0 then
+        push("<nenhuma tabela contendo TextBox/UNLOCK/Status foi encontrada>")
     else
-        setStatus("Concluido: " .. tostring(#result) .. " candidatos")
+        for idx, item in ipairs(uiTables) do
+            push(string.format("UI_TABLE #%d path=%s refs=%s", idx, item.path, item.which))
+            local entries = {}
+            for k,v in pairs(item.t) do entries[#entries+1] = {k=k,v=v} end
+            table.sort(entries, function(a,b) return tostring(a.k) < tostring(b.k) end)
+            for i,e in ipairs(entries) do
+                if i > 300 then push("  ... limite 300 ..."); break end
+                push("  " .. keyLabel(e.k) .. " => " .. valueSummary(e.v))
+            end
+            push("")
+        end
+    end
+
+    table.sort(largeTables, function(a,b)
+        if a.strings == b.strings then return a.total > b.total end
+        return a.strings > b.strings
+    end)
+
+    push("========== GRANDES TABELAS DE STRINGS ==========")
+    local maxTables = math.min(#largeTables, 6)
+    for ti = 1, maxTables do
+        local item = largeTables[ti]
+        push(string.format(
+            "STRING_TABLE #%d path=%s total=%d strings=%d functions=%d tables=%d instances=%d",
+            ti, item.path, item.total, item.strings, item.funcs, item.tables, item.instances
+        ))
+
+        local entries = {}
+        for k,v in pairs(item.t) do
+            if type(v) == "string" then entries[#entries+1] = {k=k,v=v} end
+        end
+        table.sort(entries, function(a,b)
+            if type(a.k) == "number" and type(b.k) == "number" then return a.k < b.k end
+            if type(a.k) == "number" then return true end
+            if type(b.k) == "number" then return false end
+            return tostring(a.k) < tostring(b.k)
+        end)
+
+        for _,e in ipairs(entries) do
+            local ratio = printableRatio(e.v)
+            push(string.format(
+                "  %s len=%d printable=%.2f ascii=\"%s\" hex=%s",
+                keyLabel(e.k), #e.v, ratio, escapedAscii(e.v), byteHex(e.v)
+            ))
+        end
+        push("")
+    end
+
+    push("========== CONSTANTES ASCII DOS CALLBACKS/PROTOS ==========")
+    local asciiSeen = {}
+    local function dumpFunctionAscii(fn, path, depth, visited)
+        if stopped or depth > 9 or visited[fn] then return end
+        visited[fn] = true
+        local c = getConstants(fn)
+        if c then
+            for k,v in pairs(c) do
+                if type(v) == "string" and printableRatio(v) == 1 and not asciiSeen[v] then
+                    asciiSeen[v] = true
+                    push(string.format("  %s.const[%s] len=%d value=\"%s\"", path, safe(k), #v, escapedAscii(v)))
+                end
+            end
+        end
+        local u = getUpvalues(fn)
+        if u then
+            for k,v in pairs(u) do
+                if type(v) == "function" then
+                    dumpFunctionAscii(v, path .. ".upvalue[" .. safe(k) .. "]", depth+1, visited)
+                end
+            end
+        end
+        local p = getProtos(fn)
+        if p then
+            for k,v in pairs(p) do
+                if type(v)=="function" then dumpFunctionAscii(v, path .. ".proto[" .. safe(k) .. "]", depth+1, visited) end
+            end
+        end
+    end
+
+    local visitedAscii = {}
+    for _,item in ipairs(callbacks) do
+        dumpFunctionAscii(item.fn, item.path, 0, visitedAscii)
+    end
+
+    push("")
+    push("Estado: " .. (stopped and "interrompido" or "scan concluído"))
+    push(string.format("Tempo: %.2fs", os.clock() - startedAt))
+    push("OBS: nenhuma tentativa de chave foi executada.")
+
+    local text = table.concat(report, "\n")
+    local filename = "ExactKeyClosureV4_" .. tostring(os.time()) .. ".txt"
+    G.EXACT_KEY_MEMORY_REPORT = text
+    G.EXACT_KEY_MEMORY_FILENAME = filename
+
+    if type(writefile) == "function" then
+        local ok, err = pcall(writefile, filename, text)
+        if ok then
+            setStatus("Concluído: " .. filename)
+        else
+            setStatus("Scan concluído; writefile falhou")
+            warn(err)
+        end
+    else
+        setStatus("Scan concluído; writefile indisponível")
     end
 
     running = false
     finished = true
 end
 
-local function destroyUI()
-    if ui then
-        pcall(function() ui:Destroy() end)
-        ui = nil
-    end
+local function stopScanner(silent)
+    stopped = true
+    running = false
+    disconnectAll()
+    if ui then pcall(function() ui:Destroy() end) end
+    ui = nil
+    G.EXACT_KEY_MEMORY_STOP = nil
+    if not silent then print("[KEY-MEM-V4] Scanner finalizado") end
 end
 
-G.EXACT_KEY_MEMORY_STOP = function(silent)
-    stopRequested = true
-    if running then
-        setStatus("Finalizando...")
-        local deadline = os.clock() + 2
-        while running and os.clock() < deadline do task.wait(0.05) end
-    elseif not finished and startedAt > 0 then
-        saveReport("scan finalizado")
-    end
-    if not silent then destroyUI() end
-end
+G.EXACT_KEY_MEMORY_STOP = stopScanner
 
 local function buildUI()
     local parent
@@ -522,23 +505,25 @@ local function buildUI()
         pcall(function() parent = game:GetService("CoreGui") end)
     end
     if not parent then
-        local plr = game:GetService("Players").LocalPlayer
-        parent = plr and plr:FindFirstChildOfClass("PlayerGui")
+        pcall(function() parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui") end)
     end
-    if not parent then return end
+    if not parent then
+        warn("[KEY-MEM-V4] sem parent para UI")
+        return
+    end
 
     ui = Instance.new("ScreenGui")
-    ui.Name = "ExactKeyMemoryScannerV3"
+    ui.Name = "ExactKeyMemoryScannerV4"
     ui.ResetOnSpawn = false
-    ui.IgnoreGuiInset = true
+    ui.IgnoreGuiInset = false
     ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     ui.Parent = parent
 
     local frame = Instance.new("Frame")
     frame.Name = "Panel"
-    frame.Size = UDim2.fromOffset(260, 112)
-    frame.Position = UDim2.new(0.5, -130, 0.12, 0)
-    frame.BackgroundColor3 = Color3.fromRGB(19, 23, 31)
+    frame.Size = UDim2.fromOffset(250, 96)
+    frame.Position = UDim2.new(0, 12, 0.5, -48)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
     frame.BorderSizePixel = 0
     frame.Active = true
     frame.Draggable = true
@@ -549,96 +534,62 @@ local function buildUI()
     corner.Parent = frame
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -16, 0, 24)
-    title.Position = UDim2.fromOffset(8, 6)
     title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(10, 5)
+    title.Size = UDim2.new(1, -20, 0, 19)
     title.Font = Enum.Font.GothamBold
     title.TextSize = 13
-    title.TextColor3 = Color3.fromRGB(240, 243, 250)
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Text = "KEY MEMORY SCAN V3"
+    title.TextColor3 = Color3.fromRGB(245,245,245)
+    title.Text = "KEY SCAN V4"
     title.Parent = frame
 
     statusLabel = Instance.new("TextLabel")
-    statusLabel.Size = UDim2.new(1, -16, 0, 26)
-    statusLabel.Position = UDim2.fromOffset(8, 31)
     statusLabel.BackgroundTransparency = 1
+    statusLabel.Position = UDim2.fromOffset(10, 25)
+    statusLabel.Size = UDim2.new(1, -20, 0, 25)
     statusLabel.Font = Enum.Font.Gotham
     statusLabel.TextSize = 11
-    statusLabel.TextColor3 = Color3.fromRGB(174, 184, 205)
+    statusLabel.TextWrapped = true
     statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statusLabel.Text = "Pronto - toque INICIAR"
+    statusLabel.TextColor3 = Color3.fromRGB(190,198,214)
+    statusLabel.Text = "Pronto — não consome tentativa"
     statusLabel.Parent = frame
 
     startButton = Instance.new("TextButton")
-    startButton.Size = UDim2.new(0.5, -12, 0, 36)
-    startButton.Position = UDim2.fromOffset(8, 66)
-    startButton.BackgroundColor3 = Color3.fromRGB(68, 126, 245)
+    startButton.Position = UDim2.fromOffset(10, 56)
+    startButton.Size = UDim2.new(0.5, -15, 0, 30)
+    startButton.BackgroundColor3 = Color3.fromRGB(68, 126, 246)
     startButton.BorderSizePixel = 0
     startButton.Font = Enum.Font.GothamBold
     startButton.TextSize = 12
-    startButton.TextColor3 = Color3.new(1, 1, 1)
+    startButton.TextColor3 = Color3.new(1,1,1)
     startButton.Text = "INICIAR"
     startButton.Parent = frame
-    Instance.new("UICorner", startButton).CornerRadius = UDim.new(0, 8)
+    local c1 = Instance.new("UICorner"); c1.CornerRadius = UDim.new(0,8); c1.Parent = startButton
 
     stopButton = Instance.new("TextButton")
-    stopButton.Size = UDim2.new(0.5, -12, 0, 36)
-    stopButton.Position = UDim2.new(0.5, 4, 0, 66)
-    stopButton.BackgroundColor3 = Color3.fromRGB(48, 55, 69)
+    stopButton.Position = UDim2.new(0.5, 5, 0, 56)
+    stopButton.Size = UDim2.new(0.5, -15, 0, 30)
+    stopButton.BackgroundColor3 = Color3.fromRGB(56, 62, 76)
     stopButton.BorderSizePixel = 0
     stopButton.Font = Enum.Font.GothamBold
     stopButton.TextSize = 12
-    stopButton.TextColor3 = Color3.new(1, 1, 1)
+    stopButton.TextColor3 = Color3.new(1,1,1)
     stopButton.Text = "FINALIZAR"
     stopButton.Parent = frame
-    Instance.new("UICorner", stopButton).CornerRadius = UDim.new(0, 8)
+    local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0,8); c2.Parent = stopButton
 
-    local startConn
-    startConn = startButton.MouseButton1Click:Connect(function()
+    addConn(startButton.MouseButton1Click:Connect(function()
         if running or finished then return end
         startButton.Text = "RODANDO..."
         startButton.AutoButtonColor = false
         task.spawn(runScan)
-    end)
+    end))
 
-    local stopConn
-    stopConn = stopButton.MouseButton1Click:Connect(function()
-        stopRequested = true
-        setStatus("Finalizando...")
-        task.spawn(function()
-            local deadline = os.clock() + 2
-            while running and os.clock() < deadline do task.wait(0.05) end
-            if not running and not finished and startedAt > 0 then
-                saveReport("scan finalizado")
-            end
-            destroyUI()
-        end)
-    end)
-
-    selfFunctions[runScan] = true
-    selfFunctions[phaseCallback] = true
-    selfFunctions[phaseMarkedGC] = true
-    selfFunctions[phaseFallback] = true
-    selfFunctions[inspectFunction] = true
-    selfFunctions[inspectValue] = true
-    selfFunctions[buildResult] = true
-    selfFunctions[saveReport] = true
-
-    pcall(function()
-        if type(getconnections) == "function" then
-            for _, c in ipairs(getconnections(startButton.MouseButton1Click)) do
-                local fn
-                pcall(function() fn = c.Function end)
-                if type(fn) == "function" then selfFunctions[fn] = true end
-            end
-            for _, c in ipairs(getconnections(stopButton.MouseButton1Click)) do
-                local fn
-                pcall(function() fn = c.Function end)
-                if type(fn) == "function" then selfFunctions[fn] = true end
-            end
-        end
-    end)
+    addConn(stopButton.MouseButton1Click:Connect(function()
+        stopScanner(false)
+    end))
 end
 
 buildUI()
