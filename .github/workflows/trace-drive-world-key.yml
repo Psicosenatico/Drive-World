@@ -63,12 +63,19 @@ jobs:
                     "local __src = ["+eq+"["+src+"]"+eq+"]\n"
                     "local __chunk, __compileErr = loadstring(__src, '@script.lua')\n"
                     "if __chunk then ok, err = pcall(__chunk) else ok=false; err=__compileErr end\n")
-          Path('trace_runner.luau').write_text(harness.replace(marker,injected,1))
+          base=harness.replace(marker,injected,1)
+          Path('trace_demo.luau').write_text(base.replace('__TRACE_SENTINEL_9F3A__','DEMO-2026-LOADER'))
+          Path('trace_trial.luau').write_text(base.replace('__TRACE_SENTINEL_9F3A__','TRIAL-7-DAYS'))
           PY
-      - name: Trace gate callbacks
+      - name: Verify DEMO key
         run: |
-          /tmp/luau/build/luau trace_runner.luau | tee trace_key.log
+          /tmp/luau/build/luau trace_demo.luau | tee trace_demo.log
+      - name: Verify TRIAL key
+        run: |
+          /tmp/luau/build/luau trace_trial.luau | tee trace_trial.log
       - uses: actions/upload-artifact@v4
         with:
-          name: drive-world-key-trace
-          path: trace_key.log
+          name: drive-world-key-verification
+          path: |
+            trace_demo.log
+            trace_trial.log
