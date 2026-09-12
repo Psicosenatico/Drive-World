@@ -1,7 +1,8 @@
 -- ExactKeyMemoryScanner.lua
--- V4 - scanner somente leitura do callback real do UNLOCK.
--- NAO preenche a chave, NAO clica UNLOCK e NAO consome tentativas.
--- Objetivo: reconstruir a estrutura da closure/VM e exportar strings BINARIAS com HEX exato.
+-- V5 - TRACE ISOLADO DO COMPARADOR DA KEY
+-- Objetivo: observar quais constantes/tabelas a VM le logo depois de TextBox.Text.
+-- Nao clica no botao real, nao preenche o TextBox real e tenta executar o callback
+-- usando uma COPIA do estado da VM + objetos falsos.
 
 local G = (getgenv and getgenv()) or _G
 
@@ -9,55 +10,31 @@ if type(G.EXACT_KEY_MEMORY_STOP) == "function" then
     pcall(G.EXACT_KEY_MEMORY_STOP, true)
 end
 
-local running = false
-local stopped = false
-local finished = false
-local startedAt = 0
+local rows = {}
 local ui, statusLabel, startButton, stopButton
+local running = false
+local finished = false
+local stopRequested = false
 local connections = {}
 
+local function log(s)
+    s = tostring(s)
+    rows[#rows + 1] = s
+    print("[KEY-TRACE-V5] " .. s)
+end
+
 local function safe(v)
-    local ok, r = pcall(tostring, v)
-    return ok and r or "<tostring error>"
+    local ok, s = pcall(tostring, v)
+    return ok and s or "<tostring error>"
 end
 
-local function typeofSafe(v)
-    local ok, r = pcall(function()
-        if typeof then return typeof(v) end
-        return type(v)
-    end)
-    return ok and r or type(v)
-end
-
-local function setStatus(text)
+local function setStatus(s)
     if statusLabel then
-        pcall(function() statusLabel.Text = tostring(text) end)
-    end
-    print("[KEY-MEM-V4] " .. tostring(text))
-end
-
-local function addConn(c)
-    connections[#connections + 1] = c
-    return c
-end
-
-local function disconnectAll()
-    for _, c in ipairs(connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    connections = {}
-end
-
-local function getConstants(fn)
-    for _, f in ipairs({rawget(G, "getconstants"), debug and debug.getconstants}) do
-        if type(f) == "function" then
-            local ok, r = pcall(f, fn)
-            if ok and type(r) == "table" then return r end
-        end
+        pcall(function() statusLabel.Text = tostring(s) end)
     end
 end
 
-local function getUpvalues(fn)
+local function getUps(fn)
     for _, f in ipairs({rawget(G, "getupvalues"), debug and debug.getupvalues}) do
         if type(f) == "function" then
             local ok, r = pcall(f, fn)
@@ -66,530 +43,574 @@ local function getUpvalues(fn)
     end
 end
 
-local function getProtos(fn)
-    for _, f in ipairs({rawget(G, "getprotos"), debug and debug.getprotos}) do
+local function setUp(fn, idx, value)
+    for _, f in ipairs({rawget(G, "setupvalue"), debug and debug.setupvalue}) do
         if type(f) == "function" then
-            local ok, r = pcall(f, fn)
-            if ok and type(r) == "table" then return r end
+            local ok = pcall(f, fn, idx, value)
+            if ok then return true end
         end
     end
+    return false
 end
 
-local function byteHex(s)
+local function hex(s, max)
     if type(s) ~= "string" then return "" end
-    local t = table.create and table.create(#s) or {}
-    for i = 1, #s do
-        t[i] = string.format("%02X", string.byte(s, i))
+    max = max or 96
+    local t = {}
+    for i = 1, math.min(#s, max) do
+        t[#t + 1] = string.format("%02X", string.byte(s, i))
     end
-    return table.concat(t)
+    local out = table.concat(t)
+    if #s > max then out = out .. "..." end
+    return out
 end
 
-local function escapedAscii(s)
-    if type(s) ~= "string" then return safe(s) end
-    local out = {}
+local function printable(s)
+    if type(s) ~= "string" then return false end
+    if #s == 0 then return true end
+    local good = 0
     for i = 1, #s do
         local b = string.byte(s, i)
-        if b == 92 then
-            out[#out + 1] = "\\\\"
-        elseif b == 34 then
-            out[#out + 1] = "\\\""
-        elseif b >= 32 and b <= 126 then
-            out[#out + 1] = string.char(b)
+        if b >= 32 and b <= 126 then good = good + 1 end
+    end
+    return (good / #s) >= 0.8
+end
+
+local function describe(v)
+    local tv = typeof and typeof(v) or type(v)
+    if type(v) == "string" then
+        if printable(v) then
+            return string.format("string len=%d ascii=%q hex=%s", #v, v, hex(v))
         else
-            out[#out + 1] = string.format("\\x%02X", b)
+            return string.format("string len=%d hex=%s", #v, hex(v))
         end
+    elseif tv == "Instance" then
+        local cn, nm = "?", "?"
+        pcall(function() cn = v.ClassName end)
+        pcall(function() nm = v.Name end)
+        return "Instance " .. tostring(cn) .. " " .. tostring(nm)
+    else
+        return tostring(tv) .. "=" .. safe(v)
     end
-    return table.concat(out)
-end
-
-local function printableRatio(s)
-    if type(s) ~= "string" or #s == 0 then return 0 end
-    local n = 0
-    for i = 1, #s do
-        local b = string.byte(s, i)
-        if b >= 32 and b <= 126 then n = n + 1 end
-    end
-    return n / #s
 end
 
 local function roots()
-    local out = {}
-    pcall(function() out[#out + 1] = game:GetService("CoreGui") end)
+    local r = {}
+    pcall(function() r[#r + 1] = game:GetService("CoreGui") end)
     pcall(function()
-        local plr = game:GetService("Players").LocalPlayer
-        if plr then
-            local pg = plr:FindFirstChildOfClass("PlayerGui")
-            if pg then out[#out + 1] = pg end
+        local p = game:GetService("Players").LocalPlayer
+        if p then
+            local pg = p:FindFirstChildOfClass("PlayerGui")
+            if pg then r[#r + 1] = pg end
         end
     end)
-    return out
+    return r
 end
 
 local function findGate()
     for _, root in ipairs(roots()) do
         local ok, desc = pcall(function() return root:GetDescendants() end)
         if ok and type(desc) == "table" then
-            local screen, box, button, status
+            local box, button, screen, frame, label
             for _, obj in ipairs(desc) do
                 pcall(function()
                     if obj:IsA("TextBox") then
                         local ph = tostring(obj.PlaceholderText or "")
-                        if ph:upper():find("ACCESS", 1, true) or ph:lower():find("key", 1, true) then
+                        if ph:lower():find("key", 1, true) or ph:upper():find("ACCESS", 1, true) then
                             box = box or obj
+                            frame = frame or obj.Parent
+                            screen = screen or obj:FindFirstAncestorOfClass("ScreenGui")
                         end
                     elseif obj:IsA("TextButton") then
                         local tx = tostring(obj.Text or "")
                         if tx:upper() == "UNLOCK" or tx:lower():find("confirm", 1, true) then
                             button = button or obj
-                        end
-                    elseif obj:IsA("TextLabel") then
-                        local tx = tostring(obj.Text or ""):lower()
-                        if tx:find("key is not valid", 1, true)
-                        or tx:find("access granted", 1, true)
-                        or tx:find("copied to clipboard", 1, true) then
-                            status = status or obj
-                        end
-                    elseif obj:IsA("ScreenGui") then
-                        local n = tostring(obj.Name or ""):lower()
-                        if n:find("key", 1, true) or n:find("loader", 1, true) then
-                            screen = screen or obj
+                            screen = screen or obj:FindFirstAncestorOfClass("ScreenGui")
                         end
                     end
                 end)
             end
-            if box and button then return screen, box, button, status end
+            if box and button then
+                if frame then
+                    pcall(function()
+                        for _, c in ipairs(frame:GetChildren()) do
+                            if c:IsA("TextLabel") then label = label or c end
+                        end
+                    end)
+                end
+                return screen, frame, box, label, button
+            end
         end
     end
 end
 
-local function getUnlockCallbacks(button)
-    local list = {}
-    if type(getconnections) ~= "function" then return list end
-
-    local function collect(signal, label)
-        local ok, cons = pcall(getconnections, signal)
-        if not ok or type(cons) ~= "table" then return end
-        for i, c in ipairs(cons) do
+local function getCallback(button)
+    if type(getconnections) ~= "function" then return nil, "getconnections indisponivel" end
+    local ok, cons = pcall(getconnections, button.MouseButton1Click)
+    if not ok or type(cons) ~= "table" then return nil, "falha em getconnections" end
+    for i, c in ipairs(cons) do
+        local fn
+        pcall(function() fn = c.Function end)
+        if type(fn) == "function" then return fn, "MouseButton1Click[" .. i .. "]" end
+    end
+    local ok2, cons2 = pcall(getconnections, button.Activated)
+    if ok2 and type(cons2) == "table" then
+        for i, c in ipairs(cons2) do
             local fn
             pcall(function() fn = c.Function end)
-            if type(fn) == "function" then
-                list[#list + 1] = {
-                    fn = fn,
-                    path = "UNLOCK." .. label .. ".connection[" .. tostring(i) .. "]"
-                }
-            end
+            if type(fn) == "function" then return fn, "Activated[" .. i .. "]" end
         end
     end
-
-    pcall(function() collect(button.MouseButton1Click, "MouseButton1Click") end)
-    pcall(function() collect(button.Activated, "Activated") end)
-    return list
+    return nil, "nenhum callback acessivel"
 end
 
 local function tableStats(t)
-    local total, strings, funcs, tables, instances = 0, 0, 0, 0, 0
-    for _, v in pairs(t) do
+    if type(t) ~= "table" then return 0,0,0 end
+    local total, strings, instances = 0,0,0
+    for _,v in pairs(t) do
         total = total + 1
-        local tp = typeofSafe(v)
-        if type(v) == "string" then strings = strings + 1
-        elseif type(v) == "function" then funcs = funcs + 1
-        elseif type(v) == "table" then tables = tables + 1
-        elseif tp == "Instance" then instances = instances + 1 end
-        if total >= 5000 then break end
+        if type(v)=="string" then strings = strings + 1 end
+        if typeof and typeof(v)=="Instance" then instances = instances + 1 end
     end
-    return total, strings, funcs, tables, instances
+    return total, strings, instances
 end
 
-local function keyLabel(k)
-    if type(k) == "number" then return "[" .. tostring(k) .. "]" end
-    if type(k) == "string" then return "[\"" .. escapedAscii(k) .. "\"]" end
-    return "[" .. safe(k) .. "]"
-end
-
-local function valueSummary(v)
-    local tp = typeofSafe(v)
-    if type(v) == "string" then
-        return string.format("string len=%d ascii=\"%s\" hex=%s", #v, escapedAscii(v), byteHex(v))
-    elseif tp == "Instance" then
-        local class, name, full = "?", "?", "?"
-        pcall(function() class = v.ClassName end)
-        pcall(function() name = v.Name end)
-        pcall(function() full = v:GetFullName() end)
-        return string.format("Instance class=%s name=%s path=%s", safe(class), safe(name), safe(full))
-    elseif type(v) == "number" or type(v) == "boolean" or type(v) == "nil" then
-        return type(v) .. "=" .. safe(v)
-    elseif type(v) == "function" then
-        return "function=" .. safe(v)
-    elseif type(v) == "table" then
-        local a,b,c,d,e = tableStats(v)
-        return string.format("table=%s total=%d strings=%d functions=%d tables=%d instances=%d", safe(v), a,b,c,d,e)
+local function tableHasInstance(t, target)
+    if type(t) ~= "table" then return false end
+    for _,v in pairs(t) do
+        if v == target then return true end
     end
-    return tp .. "=" .. safe(v)
+    return false
 end
 
-local function runScan()
+local function locateStateOwner(dispatcher, box)
+    local ups = getUps(dispatcher)
+    if not ups then return end
+    for i,v in pairs(ups) do
+        if type(v)=="table" and tableHasInstance(v, box) then
+            return dispatcher, i, v
+        end
+    end
+end
+
+local function locatePoolOwner(fn, depth, seen)
+    if type(fn) ~= "function" then return end
+    depth = depth or 0
+    seen = seen or {}
+    if depth > 4 or seen[fn] then return end
+    seen[fn] = true
+
+    local ups = getUps(fn)
+    if not ups then return end
+    for i,v in pairs(ups) do
+        if type(v)=="table" then
+            local total, strings = tableStats(v)
+            if total >= 190 and total <= 230 and strings == total then
+                return fn, i, v
+            end
+        elseif type(v)=="function" then
+            local a,b,c = locatePoolOwner(v, depth+1, seen)
+            if a then return a,b,c end
+        end
+    end
+end
+
+local function shallowCopy(t)
+    local n = {}
+    for k,v in pairs(t) do n[k]=v end
+    return n
+end
+
+local function makeFakeTextBox(sentinel, onRead)
+    return setmetatable({Name="TextBox", ClassName="TextBox"}, {
+        __index = function(_, k)
+            if k == "Text" then
+                onRead()
+                return sentinel
+            end
+            if k == "PlaceholderText" then return "ACCESS-KEY" end
+            if k == "ClearTextOnFocus" then return false end
+            return nil
+        end,
+        __newindex = function(t,k,v)
+            rawset(t,k,v)
+        end,
+    })
+end
+
+local function makeFakeLabel(onWrite)
+    local store = {Name="TextLabel", ClassName="TextLabel"}
+    return setmetatable(store, {
+        __index=function(t,k) return rawget(t,k) end,
+        __newindex=function(t,k,v)
+            if k=="Text" then onWrite(v) end
+            rawset(t,k,v)
+        end,
+    })
+end
+
+local function makeFakeScreen(onDestroy)
+    local t = {Name="KeySystemUI", ClassName="ScreenGui"}
+    t.Destroy = function()
+        onDestroy()
+    end
+    return t
+end
+
+local function makeFakeFrame()
+    return {Name="Frame", ClassName="Frame"}
+end
+
+local function saveReport()
+    local report = table.concat(rows, "\n")
+    G.EXACT_KEY_MEMORY_REPORT = report
+    local name = "ExactKeyComparatorV5_" .. tostring(os.time()) .. ".txt"
+    if type(writefile)=="function" then
+        local ok = pcall(writefile, name, report)
+        if ok then log("Relatorio salvo em: " .. name) end
+    end
+    return report
+end
+
+local function runTrace()
     if running or finished then return end
     running = true
-    stopped = false
-    startedAt = os.clock()
+    stopRequested = false
+    setStatus("Localizando callback...")
 
-    setStatus("Procurando gate...")
-    local screen, box, button, status = findGate()
+    rows = {}
+    log("ExactKeyMemoryScanner V5")
+    log("Modo: TRACE ISOLADO / sem clique real")
+
+    local screen, frame, box, label, button = findGate()
     if not box or not button then
-        setStatus("Gate ACCESS-KEY / UNLOCK não encontrado")
-        running = false
+        log("ERRO: gate ACCESS-KEY/UNLOCK nao encontrado.")
+        setStatus("Gate nao encontrado")
+        running=false
         return
     end
 
-    setStatus("Lendo callback do UNLOCK...")
-    local callbacks = getUnlockCallbacks(button)
-    if #callbacks == 0 then
-        setStatus("Nenhum callback acessível")
-        running = false
+    log("Screen: " .. safe(screen))
+    log("TextBox: " .. safe(box))
+    log("Button: " .. safe(button))
+    if label then log("Label: " .. safe(label)) end
+
+    local cb, cbName = getCallback(button)
+    if type(cb) ~= "function" then
+        log("ERRO: " .. tostring(cbName))
+        setStatus("Callback inacessivel")
+        running=false
+        return
+    end
+    log("Callback: " .. tostring(cbName) .. " => " .. safe(cb))
+
+    local cbUps = getUps(cb)
+    if not cbUps then
+        log("ERRO: nao foi possivel ler upvalues do callback")
+        setStatus("Sem upvalues")
+        running=false
         return
     end
 
-    local report = {}
-    local function push(s) report[#report + 1] = tostring(s) end
-
-    push("ExactKeyMemoryScanner V4")
-    push("Modo: SOMENTE LEITURA")
-    push("Tempo inicial: " .. tostring(os.time()))
-    push("Callbacks UNLOCK acessíveis: " .. tostring(#callbacks))
-    push("TextBox: " .. safe(box))
-    push("UNLOCK: " .. safe(button))
-    push("Status: " .. safe(status))
-    push("")
-
-    local seenF, seenT = {}, {}
-    local largeTables = {}
-    local uiTables = {}
-    local functionPaths = {}
-
-    local function registerLargeTable(t, path)
-        local total, strings, funcs, tables, instances = tableStats(t)
-        if strings >= 12 then
-            largeTables[#largeTables + 1] = {
-                t=t, path=path, total=total, strings=strings, funcs=funcs, tables=tables, instances=instances
-            }
-        end
+    log("UPVALUES CALLBACK:")
+    local dispatcher
+    for i,v in pairs(cbUps) do
+        log("  ["..tostring(i).."] "..describe(v))
+        if not dispatcher and type(v)=="function" then dispatcher=v end
     end
 
-    local function tableHasUI(t)
-        local found = false
-        local names = {}
-        for k,v in pairs(t) do
-            if v == box then found = true; names[#names+1] = keyLabel(k) .. "=TEXTBOX" end
-            if v == button then found = true; names[#names+1] = keyLabel(k) .. "=UNLOCK" end
-            if screen and v == screen then found = true; names[#names+1] = keyLabel(k) .. "=SCREEN" end
-            if status and v == status then found = true; names[#names+1] = keyLabel(k) .. "=STATUS" end
-        end
-        return found, table.concat(names, ", ")
+    if type(dispatcher) ~= "function" then
+        log("ERRO: dispatcher nao localizado")
+        setStatus("Dispatcher nao encontrado")
+        running=false
+        return
     end
 
-    local inspectFunction, inspectValue
-
-    inspectValue = function(v, path, depth)
-        if stopped or depth > 9 then return end
-        if type(v) == "function" then
-            inspectFunction(v, path, depth + 1)
-            return
-        end
-        if type(v) ~= "table" then return end
-        if seenT[v] then return end
-        seenT[v] = true
-
-        registerLargeTable(v, path)
-        local hasUI, which = tableHasUI(v)
-        if hasUI then
-            uiTables[#uiTables + 1] = {t=v, path=path, which=which}
-        end
-
-        local n = 0
-        for k,val in pairs(v) do
-            if stopped then return end
-            n = n + 1
-            if n > 1500 then break end
-            if type(val) == "function" or type(val) == "table" then
-                inspectValue(val, path .. keyLabel(k), depth + 1)
-            end
-        end
+    local stateOwner, stateIndex, state = locateStateOwner(dispatcher, box)
+    if not state then
+        log("ERRO: tabela de estado com TextBox nao encontrada nos upvalues diretos do dispatcher")
+        setStatus("Estado nao encontrado")
+        running=false
+        return
     end
 
-    inspectFunction = function(fn, path, depth)
-        if stopped or depth > 9 then return end
-        if type(fn) ~= "function" or seenF[fn] then return end
-        seenF[fn] = true
-        functionPaths[#functionPaths + 1] = path
+    local stTotal, stStrings, stInstances = tableStats(state)
+    log(string.format("STATE: owner=%s upvalue=%s total=%d strings=%d instances=%d", safe(stateOwner), tostring(stateIndex), stTotal, stStrings, stInstances))
 
-        local ups = getUpvalues(fn)
-        if ups then
-            for k,v in pairs(ups) do
-                if type(v) == "function" or type(v) == "table" then
-                    inspectValue(v, path .. ".upvalue[" .. safe(k) .. "]", depth + 1)
-                end
-            end
-        end
-
-        local protos = getProtos(fn)
-        if protos then
-            for i,p in pairs(protos) do
-                if type(p) == "function" then
-                    inspectFunction(p, path .. ".proto[" .. tostring(i) .. "]", depth + 1)
-                end
-            end
-        end
+    local poolOwner, poolIndex, pool = locatePoolOwner(dispatcher, 0, {})
+    if not pool then
+        log("ERRO: pool ~207 strings nao encontrada")
+        setStatus("Pool nao encontrada")
+        running=false
+        return
     end
 
-    for i, item in ipairs(callbacks) do
-        if stopped then break end
-        setStatus("Mapeando callback " .. tostring(i) .. "/" .. tostring(#callbacks))
-        inspectFunction(item.fn, item.path, 0)
-        task.wait()
+    local pTotal,pStrings = tableStats(pool)
+    log(string.format("POOL: owner=%s upvalue=%s total=%d strings=%d", safe(poolOwner), tostring(poolIndex), pTotal, pStrings))
+
+    local hasSetup = false
+    for _,f in ipairs({rawget(G,"setupvalue"), debug and debug.setupvalue}) do
+        if type(f)=="function" then hasSetup=true break end
+    end
+    if not hasSetup then
+        log("ERRO: executor nao possui setupvalue/debug.setupvalue; trace isolado nao pode ser feito.")
+        setStatus("setupvalue indisponivel")
+        running=false
+        saveReport()
+        return
     end
 
-    push("========== ESTRUTURA ==========")
-    push("Funções alcançadas: " .. tostring(#functionPaths))
-    push("Tabelas grandes de strings: " .. tostring(#largeTables))
-    push("Tabelas contendo referências da UI: " .. tostring(#uiTables))
-    push("")
+    setStatus("Preparando estado isolado...")
 
-    push("========== UPVALUES DIRETOS DOS CALLBACKS ==========")
-    for _, item in ipairs(callbacks) do
-        push("CALLBACK " .. item.path)
-        local ups = getUpvalues(item.fn)
-        if ups then
-            local keys = {}
-            for k in pairs(ups) do keys[#keys+1] = k end
-            table.sort(keys, function(a,b) return tostring(a) < tostring(b) end)
-            for _,k in ipairs(keys) do
-                push("  upvalue[" .. safe(k) .. "] => " .. valueSummary(ups[k]))
-            end
-        else
-            push("  <upvalues indisponíveis>")
+    local beforeBoxText = ""
+    local beforeLabelText = nil
+    pcall(function() beforeBoxText = box.Text end)
+    if label then pcall(function() beforeLabelText = label.Text end) end
+
+    local sawText = false
+    local poolReads = {}
+    local statusWrites = {}
+    local destroyed = false
+    local sentinel = "__KEY_TRACE_SENTINEL_V5__"
+
+    local function recordPool(k,v)
+        if not sawText then return end
+        if #poolReads >= 80 then return end
+        poolReads[#poolReads+1] = {k=k, v=v}
+    end
+
+    local poolProxy = setmetatable({}, {
+        __index=function(_,k)
+            local v = pool[k]
+            recordPool(k,v)
+            return v
+        end,
+        __newindex=function(_,k,v)
+            -- Isolado: nunca escreve na pool original.
+            rawset(_,k,v)
+        end,
+        __len=function() return #pool end,
+        __pairs=function() return pairs(pool) end,
+        __ipairs=function() return ipairs(pool) end,
+    })
+
+    local stateClone = shallowCopy(state)
+    local fakeBox = makeFakeTextBox(sentinel, function()
+        if not sawText then
+            sawText = true
+            log("TRACE EVENT: TextBox.Text lido")
         end
-    end
-    push("")
-
-    push("========== TABELAS COM REFERÊNCIAS DA UI ==========")
-    if #uiTables == 0 then
-        push("<nenhuma tabela contendo TextBox/UNLOCK/Status foi encontrada>")
-    else
-        for idx, item in ipairs(uiTables) do
-            push(string.format("UI_TABLE #%d path=%s refs=%s", idx, item.path, item.which))
-            local entries = {}
-            for k,v in pairs(item.t) do entries[#entries+1] = {k=k,v=v} end
-            table.sort(entries, function(a,b) return tostring(a.k) < tostring(b.k) end)
-            for i,e in ipairs(entries) do
-                if i > 300 then push("  ... limite 300 ..."); break end
-                push("  " .. keyLabel(e.k) .. " => " .. valueSummary(e.v))
-            end
-            push("")
-        end
-    end
-
-    table.sort(largeTables, function(a,b)
-        if a.strings == b.strings then return a.total > b.total end
-        return a.strings > b.strings
     end)
+    local fakeLabel = makeFakeLabel(function(v)
+        statusWrites[#statusWrites+1] = v
+    end)
+    local fakeScreen = makeFakeScreen(function()
+        destroyed = true
+    end)
+    local fakeFrame = makeFakeFrame()
 
-    push("========== GRANDES TABELAS DE STRINGS ==========")
-    local maxTables = math.min(#largeTables, 6)
-    for ti = 1, maxTables do
-        local item = largeTables[ti]
-        push(string.format(
-            "STRING_TABLE #%d path=%s total=%d strings=%d functions=%d tables=%d instances=%d",
-            ti, item.path, item.total, item.strings, item.funcs, item.tables, item.instances
-        ))
-
-        local entries = {}
-        for k,v in pairs(item.t) do
-            if type(v) == "string" then entries[#entries+1] = {k=k,v=v} end
-        end
-        table.sort(entries, function(a,b)
-            if type(a.k) == "number" and type(b.k) == "number" then return a.k < b.k end
-            if type(a.k) == "number" then return true end
-            if type(b.k) == "number" then return false end
-            return tostring(a.k) < tostring(b.k)
-        end)
-
-        for _,e in ipairs(entries) do
-            local ratio = printableRatio(e.v)
-            push(string.format(
-                "  %s len=%d printable=%.2f ascii=\"%s\" hex=%s",
-                keyLabel(e.k), #e.v, ratio, escapedAscii(e.v), byteHex(e.v)
-            ))
-        end
-        push("")
+    for k,v in pairs(stateClone) do
+        if v == box then stateClone[k] = fakeBox end
+        if label and v == label then stateClone[k] = fakeLabel end
+        if screen and v == screen then stateClone[k] = fakeScreen end
+        if frame and v == frame then stateClone[k] = fakeFrame end
     end
 
-    push("========== CONSTANTES ASCII DOS CALLBACKS/PROTOS ==========")
-    local asciiSeen = {}
-    local function dumpFunctionAscii(fn, path, depth, visited)
-        if stopped or depth > 9 or visited[fn] then return end
-        visited[fn] = true
-        local c = getConstants(fn)
-        if c then
-            for k,v in pairs(c) do
-                if type(v) == "string" and printableRatio(v) == 1 and not asciiSeen[v] then
-                    asciiSeen[v] = true
-                    push(string.format("  %s.const[%s] len=%d value=\"%s\"", path, safe(k), #v, escapedAscii(v)))
-                end
-            end
-        end
-        local u = getUpvalues(fn)
-        if u then
-            for k,v in pairs(u) do
-                if type(v) == "function" then
-                    dumpFunctionAscii(v, path .. ".upvalue[" .. safe(k) .. "]", depth+1, visited)
-                end
-            end
-        end
-        local p = getProtos(fn)
-        if p then
-            for k,v in pairs(p) do
-                if type(v)=="function" then dumpFunctionAscii(v, path .. ".proto[" .. safe(k) .. "]", depth+1, visited) end
-            end
+    -- Clona tabelas diretas do callback (ex.: upvalue[3]) para nao alterar estado auxiliar.
+    local cbTableOriginals = {}
+    for i,v in pairs(cbUps) do
+        if type(v)=="table" then
+            cbTableOriginals[#cbTableOriginals+1] = {idx=i, value=v}
         end
     end
 
-    local visitedAscii = {}
-    for _,item in ipairs(callbacks) do
-        dumpFunctionAscii(item.fn, item.path, 0, visitedAscii)
+    local replacedState = setUp(stateOwner, stateIndex, stateClone)
+    local replacedPool = setUp(poolOwner, poolIndex, poolProxy)
+    local replacedTables = {}
+    for _,entry in ipairs(cbTableOriginals) do
+        local copy = shallowCopy(entry.value)
+        if setUp(cb, entry.idx, copy) then
+            replacedTables[#replacedTables+1] = entry
+        end
     end
 
-    push("")
-    push("Estado: " .. (stopped and "interrompido" or "scan concluído"))
-    push(string.format("Tempo: %.2fs", os.clock() - startedAt))
-    push("OBS: nenhuma tentativa de chave foi executada.")
+    if not replacedState or not replacedPool then
+        log("ERRO: nao foi possivel trocar state/pool por copias isoladas")
+        pcall(setUp, stateOwner, stateIndex, state)
+        pcall(setUp, poolOwner, poolIndex, pool)
+        for _,e in ipairs(replacedTables) do pcall(setUp,cb,e.idx,e.value) end
+        setStatus("Falha ao isolar")
+        running=false
+        saveReport()
+        return
+    end
 
-    local text = table.concat(report, "\n")
-    local filename = "ExactKeyClosureV4_" .. tostring(os.time()) .. ".txt"
-    G.EXACT_KEY_MEMORY_REPORT = text
-    G.EXACT_KEY_MEMORY_FILENAME = filename
+    setStatus("Executando trace isolado...")
+    local okRun, errRun = pcall(cb)
 
-    if type(writefile) == "function" then
-        local ok, err = pcall(writefile, filename, text)
-        if ok then
-            setStatus("Concluído: " .. filename)
-        else
-            setStatus("Scan concluído; writefile falhou")
-            warn(err)
-        end
+    -- RESTAURA PRIMEIRO, antes de qualquer analise/print.
+    pcall(setUp, stateOwner, stateIndex, state)
+    pcall(setUp, poolOwner, poolIndex, pool)
+    for _,e in ipairs(replacedTables) do pcall(setUp,cb,e.idx,e.value) end
+
+    log("TRACE RESULT: ok=" .. tostring(okRun) .. " err=" .. safe(errRun))
+    log("TextBox fake lido: " .. tostring(sawText))
+    log("Fake Screen Destroy chamado: " .. tostring(destroyed))
+
+    log("")
+    log("========== LEITURAS DA POOL APOS TextBox.Text ==========")
+    if #poolReads == 0 then
+        log("<nenhuma leitura registrada>")
     else
-        setStatus("Scan concluído; writefile indisponível")
+        for i,e in ipairs(poolReads) do
+            log(string.format("[%02d] pool[%s] => %s", i, tostring(e.k), describe(e.v)))
+        end
     end
 
-    running = false
+    log("")
+    log("========== ESCRITAS NO STATUS FAKE ==========")
+    if #statusWrites==0 then
+        log("<nenhuma escrita>")
+    else
+        for i,v in ipairs(statusWrites) do
+            log(string.format("[%02d] %s",i,describe(v)))
+        end
+    end
+
+    log("")
+    log("========== ALTERACOES NO STATE CLONADO ==========")
+    local changed = 0
+    for k,v in pairs(stateClone) do
+        local original = state[k]
+        local isUiReplacement = (original==box or original==label or original==screen or original==frame)
+        if not isUiReplacement and v ~= original then
+            changed = changed + 1
+            if changed <= 120 then
+                log("state["..safe(k).."] original="..describe(original).." clone="..describe(v))
+            end
+        end
+    end
+    if changed==0 then log("<nenhuma alteracao detectada>") end
+    log("Total state alterado: " .. tostring(changed))
+
+    -- Verificacao de seguranca: GUI real deve estar identica.
+    local afterBoxText = beforeBoxText
+    local afterLabelText = beforeLabelText
+    pcall(function() afterBoxText = box.Text end)
+    if label then pcall(function() afterLabelText = label.Text end) end
+
+    local leaked = (afterBoxText ~= beforeBoxText) or (label and afterLabelText ~= beforeLabelText)
+    log("")
+    log("========== VERIFICACAO DE SEGURANCA ==========")
+    log("GUI real alterada: " .. tostring(leaked))
+    if leaked then
+        log("AVISO: houve alteracao visivel na GUI real; nao repetir este trace nesta sessao.")
+        pcall(function() box.Text = beforeBoxText end)
+        if label and beforeLabelText ~= nil then pcall(function() label.Text = beforeLabelText end) end
+    else
+        log("OK: TextBox/status reais permaneceram intactos.")
+    end
+
     finished = true
+    running = false
+    setStatus(leaked and "Concluido com AVISO" or "Concluido - sem tentativa real")
+    saveReport()
 end
 
 local function stopScanner(silent)
-    stopped = true
+    stopRequested = true
     running = false
-    disconnectAll()
+    for _,c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    connections = {}
     if ui then pcall(function() ui:Destroy() end) end
-    ui = nil
-    G.EXACT_KEY_MEMORY_STOP = nil
-    if not silent then print("[KEY-MEM-V4] Scanner finalizado") end
+    ui=nil
+    if not silent then
+        saveReport()
+    end
 end
 
 G.EXACT_KEY_MEMORY_STOP = stopScanner
 
 local function buildUI()
     local parent
-    pcall(function()
-        if type(gethui) == "function" then parent = gethui() end
-    end)
+    pcall(function() parent = game:GetService("CoreGui") end)
     if not parent then
-        pcall(function() parent = game:GetService("CoreGui") end)
+        local p = game:GetService("Players").LocalPlayer
+        parent = p and p:FindFirstChildOfClass("PlayerGui")
     end
-    if not parent then
-        pcall(function() parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui") end)
-    end
-    if not parent then
-        warn("[KEY-MEM-V4] sem parent para UI")
-        return
-    end
+    if not parent then return end
 
     ui = Instance.new("ScreenGui")
-    ui.Name = "ExactKeyMemoryScannerV4"
+    ui.Name = "ExactKeyTraceV5UI"
     ui.ResetOnSpawn = false
-    ui.IgnoreGuiInset = false
-    ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ui.IgnoreGuiInset = true
     ui.Parent = parent
 
     local frame = Instance.new("Frame")
-    frame.Name = "Panel"
-    frame.Size = UDim2.fromOffset(250, 96)
-    frame.Position = UDim2.new(0, 12, 0.5, -48)
-    frame.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
+    frame.Size = UDim2.fromOffset(250, 104)
+    frame.Position = UDim2.new(0.5,-125,0.14,0)
+    frame.BackgroundColor3 = Color3.fromRGB(24,27,35)
     frame.BorderSizePixel = 0
     frame.Active = true
     frame.Draggable = true
     frame.Parent = ui
 
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 10)
+    corner.CornerRadius = UDim.new(0,10)
     corner.Parent = frame
 
     local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1,-16,0,22)
+    title.Position = UDim2.fromOffset(8,6)
     title.BackgroundTransparency = 1
-    title.Position = UDim2.fromOffset(10, 5)
-    title.Size = UDim2.new(1, -20, 0, 19)
+    title.Text = "KEY TRACE V5"
+    title.TextColor3 = Color3.fromRGB(240,240,245)
     title.Font = Enum.Font.GothamBold
-    title.TextSize = 13
+    title.TextSize = 14
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = Color3.fromRGB(245,245,245)
-    title.Text = "KEY SCAN V4"
     title.Parent = frame
 
     statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1,-16,0,20)
+    statusLabel.Position = UDim2.fromOffset(8,30)
     statusLabel.BackgroundTransparency = 1
-    statusLabel.Position = UDim2.fromOffset(10, 25)
-    statusLabel.Size = UDim2.new(1, -20, 0, 25)
+    statusLabel.Text = "Pronto - trace isolado"
+    statusLabel.TextColor3 = Color3.fromRGB(175,185,205)
     statusLabel.Font = Enum.Font.Gotham
     statusLabel.TextSize = 11
-    statusLabel.TextWrapped = true
     statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statusLabel.TextColor3 = Color3.fromRGB(190,198,214)
-    statusLabel.Text = "Pronto — não consome tentativa"
     statusLabel.Parent = frame
 
     startButton = Instance.new("TextButton")
-    startButton.Position = UDim2.fromOffset(10, 56)
-    startButton.Size = UDim2.new(0.5, -15, 0, 30)
-    startButton.BackgroundColor3 = Color3.fromRGB(68, 126, 246)
-    startButton.BorderSizePixel = 0
+    startButton.Size = UDim2.new(0.5,-12,0,34)
+    startButton.Position = UDim2.new(0,8,1,-42)
+    startButton.BackgroundColor3 = Color3.fromRGB(65,125,245)
+    startButton.TextColor3 = Color3.new(1,1,1)
     startButton.Font = Enum.Font.GothamBold
     startButton.TextSize = 12
-    startButton.TextColor3 = Color3.new(1,1,1)
     startButton.Text = "INICIAR"
     startButton.Parent = frame
-    local c1 = Instance.new("UICorner"); c1.CornerRadius = UDim.new(0,8); c1.Parent = startButton
+    local c1=Instance.new("UICorner"); c1.CornerRadius=UDim.new(0,8); c1.Parent=startButton
 
     stopButton = Instance.new("TextButton")
-    stopButton.Position = UDim2.new(0.5, 5, 0, 56)
-    stopButton.Size = UDim2.new(0.5, -15, 0, 30)
-    stopButton.BackgroundColor3 = Color3.fromRGB(56, 62, 76)
-    stopButton.BorderSizePixel = 0
+    stopButton.Size = UDim2.new(0.5,-12,0,34)
+    stopButton.Position = UDim2.new(0.5,4,1,-42)
+    stopButton.BackgroundColor3 = Color3.fromRGB(55,60,72)
+    stopButton.TextColor3 = Color3.new(1,1,1)
     stopButton.Font = Enum.Font.GothamBold
     stopButton.TextSize = 12
-    stopButton.TextColor3 = Color3.new(1,1,1)
     stopButton.Text = "FINALIZAR"
     stopButton.Parent = frame
-    local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0,8); c2.Parent = stopButton
+    local c2=Instance.new("UICorner"); c2.CornerRadius=UDim.new(0,8); c2.Parent=stopButton
 
-    addConn(startButton.MouseButton1Click:Connect(function()
-        if running or finished then return end
-        startButton.Text = "RODANDO..."
-        startButton.AutoButtonColor = false
-        task.spawn(runScan)
-    end))
-
-    addConn(stopButton.MouseButton1Click:Connect(function()
+    connections[#connections+1]=startButton.MouseButton1Click:Connect(function()
+        if not running and not finished then
+            task.spawn(runTrace)
+        end
+    end)
+    connections[#connections+1]=stopButton.MouseButton1Click:Connect(function()
         stopScanner(false)
-    end))
+    end)
 end
 
 buildUI()
