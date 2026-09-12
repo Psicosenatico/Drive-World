@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Static analysis helper for the original Drive World loader.
 import ast
 import re
 import urllib.request
@@ -118,6 +119,4 @@ for idx, b in enumerate(decoded, 1):
     ):
         print(f"CANDIDATE [{idx:03d}] {s!r}")
 
-# Also report constants referenced near the visible gate-related API names once
-# the first layer is available. This is purely static; nothing is executed.
 print("OUTPUT_FILE=script_lua_decoded_strings.txt")
