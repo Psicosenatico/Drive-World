@@ -1,5 +1,5 @@
--- PSICOSENATICO | Drive World Vehicle Menu V5.5
--- Base V5.4 preservada; PRESSAO+ refeita para usar pedal real + marcha real.
+-- PSICOSENATICO | Drive World Vehicle Menu V5.5.1
+-- Hotfix: transicao RE -> FRENTE sem Pressao+ empurrar no sentido antigo.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -9,27 +9,28 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local G = (getgenv and getgenv()) or _G
 
-if type(G.PSICO_DRIVE_V55_STOP) == "function" then
-    pcall(G.PSICO_DRIVE_V55_STOP)
+if type(G.PSICO_DRIVE_V551_STOP) == "function" then
+    pcall(G.PSICO_DRIVE_V551_STOP)
 end
 
--- Mantem tudo que ja ficou aprovado na V5.4, inclusive a barra de freio.
-local BASE_URL = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/f6def77bf8c71106c35104e9fd1c38eff845ebe8/Script/main.lua"
+-- V5.5 comprovadamente funcional como base: freio, nitro, 0 derrape,
+-- dirigibilidade e minimizar permanecem intactos.
+local BASE_URL = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/427359c972821929b28f666b1cc6165d7e4cd8b7/Script/main.lua"
 local okSource, baseSource = pcall(function()
     return game:HttpGet(BASE_URL)
 end)
 if not okSource or type(baseSource) ~= "string" or #baseSource < 1000 then
-    error("Drive World V5.5: falha ao baixar a base V5.4")
+    error("Drive World V5.5.1: falha ao baixar a base V5.5")
 end
 
 local baseFn, compileError = loadstring(baseSource)
 if not baseFn then
-    error("Drive World V5.5: base V5.4 nao compilou: " .. tostring(compileError))
+    error("Drive World V5.5.1: base V5.5 nao compilou: " .. tostring(compileError))
 end
 
 local okBase, baseError = pcall(baseFn)
 if not okBase then
-    error("Drive World V5.5: base V5.4 falhou: " .. tostring(baseError))
+    error("Drive World V5.5.1: base V5.5 falhou: " .. tostring(baseError))
 end
 
 local running = true
@@ -48,11 +49,8 @@ local TORQUE_MULTIPLIER = 1.65
 local PRESSURE_ACCEL = 58
 local originalTorque = setmetatable({}, {__mode = "k"})
 
--- Pedal real da interface. O scan nao mostrou throttle confiavel no controller,
--- entao o estado do toque e usado como fonte principal no mobile.
-local accelButtonsBound = setmetatable({}, {__mode = "k"})
-local activeAccelInputs = setmetatable({}, {__mode = "k"})
-local accelButtonCount = 0
+local forwardButtonsBound = setmetatable({}, {__mode = "k"})
+local activeForwardInputs = setmetatable({}, {__mode = "k"})
 
 local function connect(signal, fn)
     local c = signal:Connect(fn)
@@ -103,7 +101,6 @@ end
 local function getGCObjects()
     local fn = rawget(G, "getgc") or getgc
     if type(fn) ~= "function" then return {} end
-
     local ok, result = pcall(fn, true)
     if not ok or type(result) ~= "table" then
         ok, result = pcall(fn)
@@ -121,14 +118,12 @@ local function scoreController(t, vehicle)
     if rawget(t, "owner") == LocalPlayer then score = score + 20 end
     if type(rawget(t, "wheelData")) == "table" then score = score + 30 end
     if type(rawget(t, "config")) == "table" then score = score + 20 end
-    if type(rawget(t, "engineSound")) == "table" then score = score + 15 end
     if rawget(t, "gear") ~= nil then score = score + 20 end
     return score
 end
 
 local function findController(vehicle)
     if controller and scoreController(controller, vehicle) >= 200 then return controller end
-
     local best, bestScore = nil, -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
@@ -165,7 +160,6 @@ end
 
 local function findEngine(ctrl)
     if engineConfig and scoreEngine(engineConfig, ctrl) >= 180 then return engineConfig end
-
     local best, bestScore = nil, -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
@@ -183,7 +177,6 @@ local function rememberTorque(engine)
     if type(engine) ~= "table" or originalTorque[engine] ~= nil then return end
     local curve = rawget(engine, "TorqueCurve")
     if type(curve) ~= "table" then return end
-
     local copy = {}
     for k, v in pairs(curve) do
         if type(v) == "number" then copy[k] = v end
@@ -194,11 +187,9 @@ end
 local function applyTorque(engine)
     if type(engine) ~= "table" then return end
     rememberTorque(engine)
-
     local saved = originalTorque[engine]
     local curve = rawget(engine, "TorqueCurve")
     if type(saved) ~= "table" or type(curve) ~= "table" then return end
-
     for k, v in pairs(saved) do
         curve[k] = pressureEnabled and (v * TORQUE_MULTIPLIER) or v
     end
@@ -227,7 +218,6 @@ local function resolveTargets(force)
     if not currentVehicle then return end
     if force or not controller then controller = findController(currentVehicle) end
     if controller and (force or not engineConfig) then engineConfig = findEngine(controller) end
-
     if engineConfig then applyTorque(engineConfig) end
 end
 
@@ -247,21 +237,15 @@ local function getGearText()
         text = label
     end
 
-    if type(text) == "string" then
-        return normalize(text)
-    end
+    if type(text) == "string" then return normalize(text) end
     return nil
 end
 
 local function getGearDirection()
     local text = getGearText()
     if text then
-        if text == "r" or text == "re" or text == "ré" or text:find("reverse", 1, true) then
-            return -1
-        end
-        if text == "n" or text:find("neutral", 1, true) then
-            return 0
-        end
+        if text == "r" or text == "re" or text == "ré" or text:find("reverse", 1, true) then return -1 end
+        if text == "n" or text:find("neutral", 1, true) then return 0 end
         local n = tonumber(text)
         if n then
             if n < 0 then return -1 end
@@ -275,20 +259,16 @@ local function getGearDirection()
         if gear then
             if gear < 0 then return -1 end
             if gear > 0 then return 1 end
-            return 0
         end
     end
-
     return 0
 end
 
 local function getSpeedCap(direction)
-    if type(controller) ~= "table" then
-        return direction < 0 and 45 or 280
-    end
-
+    if type(controller) ~= "table" then return direction < 0 and 45 or 280 end
     local cached = rawget(controller, "cachedGears")
     local tops = type(cached) == "table" and rawget(cached, "topSpeeds") or nil
+
     if type(tops) == "table" then
         if direction < 0 then
             for k, v in pairs(tops) do
@@ -312,17 +292,13 @@ local function getSpeedCap(direction)
     return direction < 0 and 45 or 280
 end
 
-local function accelCandidate(obj)
+local function forwardCandidate(obj)
     if not obj or not obj:IsA("GuiButton") then return false end
-
     local screen = obj:FindFirstAncestorOfClass("ScreenGui")
-    if screen and normalize(screen.Name):find("psicodrivemenu", 1, true) then
-        return false
-    end
+    if screen and normalize(screen.Name):find("psicodrivemenu", 1, true) then return false end
 
     local parts = {obj.Name}
     if obj:IsA("TextButton") then parts[#parts + 1] = obj.Text end
-
     local node = obj.Parent
     for _ = 1, 4 do
         if not node then break end
@@ -335,76 +311,82 @@ local function accelCandidate(obj)
         "accelerate", "accel", "accelerator", "acelerar", "acelerador",
         "throttle", "gas", "forward", "gaspedal", "pedalgas"
     }
-
     for _, word in ipairs(keywords) do
         if text:find(word, 1, true) then return true end
     end
     return false
 end
 
-local function updateAccelHeld()
-    return next(activeAccelInputs) ~= nil
-end
-
-local function bindAccelButton(obj)
-    if accelButtonsBound[obj] or not accelCandidate(obj) then return end
-    accelButtonsBound[obj] = true
-    accelButtonCount = accelButtonCount + 1
+local function bindForwardButton(obj)
+    if forwardButtonsBound[obj] or not forwardCandidate(obj) then return end
+    forwardButtonsBound[obj] = true
 
     connect(obj.InputBegan, function(input)
         if input.UserInputType == Enum.UserInputType.Touch
         or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            activeAccelInputs[input] = true
+            activeForwardInputs[input] = true
         end
     end)
 
     connect(obj.InputEnded, function(input)
-        activeAccelInputs[input] = nil
+        activeForwardInputs[input] = nil
     end)
 end
 
-local function watchAccelButtons(root)
+local function watchForwardButtons(root)
     if not root then return end
     for _, obj in ipairs(root:GetDescendants()) do
-        bindAccelButton(obj)
+        bindForwardButton(obj)
     end
-    connect(root.DescendantAdded, bindAccelButton)
+    connect(root.DescendantAdded, bindForwardButton)
 end
 
-local function keyboardOrGamepadForward()
-    local okW, w = pcall(function() return UserInputService:IsKeyDown(Enum.KeyCode.W) end)
-    if okW and w then return true end
-    local okUp, up = pcall(function() return UserInputService:IsKeyDown(Enum.KeyCode.Up) end)
-    if okUp and up then return true end
+local function forwardHeld()
+    return next(activeForwardInputs) ~= nil
+end
 
+local function keyDown(key)
+    local ok, value = pcall(function() return UserInputService:IsKeyDown(key) end)
+    return ok and value or false
+end
+
+local function keyboardForward()
+    if keyDown(Enum.KeyCode.W) or keyDown(Enum.KeyCode.Up) then return true end
     local okPad, pad = pcall(function()
         return UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2)
     end)
     return okPad and pad or false
 end
 
-local function seatThrottleActive(direction)
-    if not currentSeat or not currentSeat:IsA("VehicleSeat") then return false end
-    local ok, throttle = pcall(function() return currentSeat.ThrottleFloat end)
-    if not ok or type(throttle) ~= "number" then return false end
-
-    if direction > 0 then return throttle > 0.04 end
-    return math.abs(throttle) > 0.04
+local function keyboardReverse()
+    return keyDown(Enum.KeyCode.S) or keyDown(Enum.KeyCode.Down)
 end
 
-local function driveInputActive(direction)
-    if updateAccelHeld() then return true end
-    if seatThrottleActive(direction) then return true end
+local function seatThrottle()
+    if not currentSeat or not currentSeat:IsA("VehicleSeat") then return nil end
+    local ok, throttle = pcall(function() return currentSeat.ThrottleFloat end)
+    if ok and type(throttle) == "number" then return throttle end
+    return nil
+end
 
-    if direction > 0 then
-        return keyboardOrGamepadForward()
-    end
+local function forwardCommandActive()
+    if forwardHeld() or keyboardForward() then return true end
+    local throttle = seatThrottle()
+    return throttle ~= nil and throttle > 0.04
+end
 
-    -- No Drive World a re passa pelo estado de frenagem/retrocesso.
-    if type(controller) == "table" and rawget(controller, "isBraking") == true then
-        return true
-    end
-    return false
+local function reverseCommandActive()
+    -- REGRA CRITICA V5.5.1:
+    -- enquanto o usuario estiver tentando ir PARA FRENTE, uma marcha R atrasada
+    -- nunca pode autorizar impulso para tras.
+    if forwardHeld() or keyboardForward() then return false end
+
+    local throttle = seatThrottle()
+    if throttle ~= nil and throttle < -0.04 then return true end
+    if keyboardReverse() then return true end
+
+    -- No mobile do Drive World o comando de re passa pelo estado de frenagem.
+    return type(controller) == "table" and rawget(controller, "isBraking") == true
 end
 
 local function applyPressureAssist(dt)
@@ -412,7 +394,12 @@ local function applyPressureAssist(dt)
 
     local direction = getGearDirection()
     if direction == 0 then return end
-    if not driveInputActive(direction) then return end
+
+    if direction > 0 then
+        if not forwardCommandActive() then return end
+    else
+        if not reverseCommandActive() then return end
+    end
 
     local main = getMainPart(currentVehicle)
     if not main or not main:IsDescendantOf(workspace) then return end
@@ -426,11 +413,7 @@ local function applyPressureAssist(dt)
     local startTaper = cap * 0.68
     local factor = 1
     if directionalSpeed > startTaper then
-        factor = math.clamp(
-            (cap - directionalSpeed) / math.max(cap - startTaper, 1),
-            0,
-            1
-        )
+        factor = math.clamp((cap - directionalSpeed) / math.max(cap - startTaper, 1), 0, 1)
     end
 
     if factor > 0 then
@@ -463,27 +446,28 @@ end
 
 local function installPressureOverride()
     menuGui = locateMenu()
-    if not menuGui then error("Drive World V5.5: menu base nao encontrado") end
+    if not menuGui then error("Drive World V5.5.1: menu base nao encontrado") end
 
     for _, obj in ipairs(menuGui:GetDescendants()) do
         if obj:IsA("TextLabel") and tostring(obj.Text):find("DRIVE WORLD V5", 1, true) then
-            obj.Text = "PSICOSENATICO • DRIVE WORLD V5.5"
+            obj.Text = "PSICOSENATICO • DRIVE WORLD V5.5.1"
             break
         end
     end
 
     originalPressureButton = locateVisiblePressureButton(menuGui)
     if not originalPressureButton then
-        error("Drive World V5.5: botao PRESSAO+ base nao encontrado")
+        error("Drive World V5.5.1: botao PRESSAO+ base nao encontrado")
     end
 
+    -- Mantem a Pressao+ da V5.5 desligada; esta revisao assume o controle.
     originalPressureButton.Visible = false
 
     local button = originalPressureButton:Clone()
-    button.Name = "PressureV55"
+    button.Name = "PressureV551"
     button.Visible = true
     button.Text = "PRESSAO +: OFF"
-    button.ZIndex = originalPressureButton.ZIndex + 20
+    button.ZIndex = originalPressureButton.ZIndex + 30
     button.Parent = originalPressureButton.Parent
     customPressureButton = button
 
@@ -517,19 +501,19 @@ local function stop()
         pcall(function() c:Disconnect() end)
     end
 
-    if G.PSICO_DRIVE_V55_STOP == stop then
-        G.PSICO_DRIVE_V55_STOP = nil
+    if G.PSICO_DRIVE_V551_STOP == stop then
+        G.PSICO_DRIVE_V551_STOP = nil
     end
 end
 
-G.PSICO_DRIVE_V55_STOP = stop
+G.PSICO_DRIVE_V551_STOP = stop
 
 installPressureOverride()
 resolveTargets(true)
 
 local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
-watchAccelButtons(playerGui)
-pcall(function() watchAccelButtons(CoreGui) end)
+watchForwardButtons(playerGui)
+pcall(function() watchForwardButtons(CoreGui) end)
 
 connect(RunService.Heartbeat, function(dt)
     if not running then return end
