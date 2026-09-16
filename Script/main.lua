@@ -1,142 +1,189 @@
--- PSICOSENATICO | Drive World Vehicle Menu V5.2.1
--- Loader fix: usa substituicao por funcao para preservar '%' no bloco inserido.
--- Pressao+ continua bloqueado em re/neutral e so auxilia quando frente esta confirmada.
+-- PSICOSENATICO | Drive World Vehicle Menu V5.3
+-- Usa a V5 funcional como base e adiciona somente a protecao da re.
 
 local CORE_URL = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/8a326ee9a89d7080667d5a4a40ddfc6506a1869b/Script/main.lua"
+
 local source = game:HttpGet(CORE_URL)
-
-local oldBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed)
-    if not flags.pressure then return end
-    local throttle = getThrottleIntent()
-    if throttle <= 0.04 or forwardSpeed < -1 then return end
-
-    local baseTop = getBaseTopSpeed()
-    local startTaper = baseTop * 0.68
-    local factor = 1
-    if forwardSpeed > startTaper then
-        factor = math.clamp((baseTop - forwardSpeed) / math.max(baseTop - startTaper, 1), 0, 1)
-    end
-    if factor > 0 then
-        main.AssemblyLinearVelocity += cf.LookVector * (PRESSURE_ACCEL * factor * dt)
-    end
-end]]
-
-local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed)
-    if not flags.pressure then return end
-
-    local throttle = getThrottleIntent()
-    if math.abs(throttle) <= 0.04 then return end
-
-    local reverseConfirmed = false
-    local forwardConfirmed = false
-    local neutralConfirmed = false
-
-    -- 1) VehicleSeat: quando disponivel, a entrada negativa confirma re.
-    if currentSeat and currentSeat:IsA("VehicleSeat") then
-        local seatThrottle
-        pcall(function() seatThrottle = currentSeat.ThrottleFloat end)
-        if type(seatThrottle) == "number" then
-            if seatThrottle < -0.04 then
-                reverseConfirmed = true
-            elseif seatThrottle > 0.04 then
-                forwardConfirmed = true
-            end
-        end
-    end
-
-    -- 2) Indicador de marcha do proprio carro: usado para BLOQUEAR R/N.
-    -- Marcha positiva nao libera impulso sozinha, porque pode estar atrasada.
-    if type(controller) == "table" then
-        local instrument = rawget(controller, "instrumentScreen")
-        local label = type(instrument) == "table" and rawget(instrument, "currentGearLabel") or nil
-        local text
-
-        if typeof(label) == "Instance" then
-            pcall(function()
-                if label:IsA("TextLabel") or label:IsA("TextButton") or label:IsA("TextBox") then
-                    text = label.Text
-                end
-            end)
-        elseif type(label) == "string" then
-            text = label
-        end
-
-        if type(text) == "string" then
-            local normalized = string.lower(text):gsub("[%s%._%-]", "")
-            if normalized == "r"
-            or normalized == "re"
-            or normalized == "ré"
-            or normalized:find("reverse", 1, true) then
-                reverseConfirmed = true
-                forwardConfirmed = false
-            elseif normalized == "n"
-            or normalized:find("neutral", 1, true) then
-                neutralConfirmed = true
-            end
-        end
-
-        -- 3) Estado numerico interno: apenas -1/negativo e 0 sao usados para bloquear.
-        local gear = tonumber(rawget(controller, "gear"))
-        if gear then
-            if gear < 0 then
-                reverseConfirmed = true
-                forwardConfirmed = false
-            elseif gear == 0 then
-                neutralConfirmed = true
-            end
-        end
-    end
-
-    -- 4) Direcao fisica do carro: confirmacao principal depois que ele comeca a andar.
-    if forwardSpeed < -0.75 then
-        reverseConfirmed = true
-        forwardConfirmed = false
-    elseif forwardSpeed > 0.75 and not reverseConfirmed then
-        forwardConfirmed = true
-    end
-
-    -- Em re ou neutro, o impulso artificial do Pressao+ fica totalmente desligado.
-    if reverseConfirmed or neutralConfirmed then return end
-
-    -- Parado/ambiguo: espera a fisica original iniciar o movimento para frente.
-    if not forwardConfirmed then return end
-    if forwardSpeed < -0.25 then return end
-
-    local baseTop = getBaseTopSpeed()
-    local startTaper = baseTop * 0.68
-    local factor = 1
-    if forwardSpeed > startTaper then
-        factor = math.clamp(
-            (baseTop - forwardSpeed) / math.max(baseTop - startTaper, 1),
-            0,
-            1
-        )
-    end
-
-    if factor > 0 then
-        main.AssemblyLinearVelocity += cf.LookVector * (PRESSURE_ACCEL * factor * dt)
-    end
-end]]
-
--- IMPORTANTE: replacement por funcao evita que '%' do codigo novo seja
--- interpretado pelo string.gsub como referencia de captura.
-local patched, replacements = source:gsub(oldBlock, function()
-    return newBlock
-end, 1)
-
-if replacements ~= 1 then
-    error("Drive World V5.2.1 hotfix: bloco Pressao+ nao encontrado")
-end
-
-patched = patched:gsub(
-    "PSICOSENATICO • DRIVE WORLD V5",
-    "PSICOSENATICO • DRIVE WORLD V5.2.1",
-    1
-)
-
-local fn, err = loadstring(patched)
+local fn, compileError = loadstring(source)
 if not fn then
-    error("Drive World V5.2.1 compile error: " .. tostring(err))
+    error("Drive World V5.3: falha ao compilar a V5 base: " .. tostring(compileError))
 end
 
-return fn()
+local ok, runtimeError = pcall(fn)
+if not ok then
+    error("Drive World V5.3: falha ao executar a V5 base: " .. tostring(runtimeError))
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+local G = (getgenv and getgenv()) or _G
+
+if type(G.PSICO_REVERSE_GUARD_STOP) == "function" then
+    pcall(G.PSICO_REVERSE_GUARD_STOP)
+end
+
+local running = true
+local conns = {}
+local preForwardSpeed = nil
+local pressureButton = nil
+local versionMarked = false
+
+local function add(conn)
+    conns[#conns + 1] = conn
+    return conn
+end
+
+local function findMenu()
+    local gui = CoreGui:FindFirstChild("PsicoDriveMenuV5")
+    if gui then return gui end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    return pg and pg:FindFirstChild("PsicoDriveMenuV5") or nil
+end
+
+local function refreshMenuRefs()
+    local gui = findMenu()
+    if not gui then return end
+
+    pressureButton = nil
+    for _, obj in ipairs(gui:GetDescendants()) do
+        if obj:IsA("TextLabel") then
+            local text = tostring(obj.Text or "")
+            if text:find("PSICOSENATICO", 1, true) and text:find("DRIVE WORLD", 1, true) then
+                obj.Text = "PSICOSENATICO • DRIVE WORLD V5.3"
+                versionMarked = true
+            end
+        elseif obj:IsA("TextButton") then
+            local text = string.upper(tostring(obj.Text or ""))
+            if text:find("PRESSAO", 1, true) or text:find("PRESSÃO", 1, true) then
+                pressureButton = obj
+            end
+        end
+    end
+end
+
+local function pressureOn()
+    if not pressureButton or not pressureButton.Parent then
+        refreshMenuRefs()
+    end
+    if not pressureButton then return false end
+    return string.upper(tostring(pressureButton.Text or "")):find(": ON", 1, true) ~= nil
+end
+
+local function getVehicleSeatMain()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not seat then return nil, nil, nil end
+
+    local vehicle = seat:FindFirstAncestorOfClass("Model")
+    local cars = workspace:FindFirstChild("Cars")
+    if cars then
+        local node = seat
+        while node and node.Parent and node.Parent ~= cars do
+            node = node.Parent
+        end
+        if node and node.Parent == cars and node:IsA("Model") then
+            vehicle = node
+        end
+    end
+
+    if not vehicle then return nil, seat, nil end
+    local main = vehicle:FindFirstChild("Main")
+    if not (main and main:IsA("BasePart")) then
+        main = vehicle.PrimaryPart
+    end
+    return vehicle, seat, main
+end
+
+local function readGearText(vehicle)
+    if not vehicle then return nil end
+
+    for _, obj in ipairs(vehicle:GetDescendants()) do
+        if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and string.lower(obj.Name) == "currentgear" then
+            return string.upper(tostring(obj.Text or ""):gsub("%s+", ""))
+        end
+    end
+
+    return nil
+end
+
+local function reverseOrNeutral(vehicle, seat, forwardSpeed)
+    local gearText = readGearText(vehicle)
+    if gearText == "R" or gearText == "RE" or gearText == "REVERSE" or gearText == "N" or gearText == "NEUTRAL" then
+        return true
+    end
+
+    if seat and seat:IsA("VehicleSeat") then
+        local throttle = nil
+        pcall(function() throttle = seat.ThrottleFloat end)
+        if type(throttle) == "number" and throttle < -0.04 then
+            return true
+        end
+    end
+
+    if forwardSpeed < -0.05 then
+        return true
+    end
+
+    return false
+end
+
+local function stop()
+    if not running then return end
+    running = false
+    for _, conn in ipairs(conns) do
+        pcall(function() conn:Disconnect() end)
+    end
+    if G.PSICO_REVERSE_GUARD_STOP == stop then
+        G.PSICO_REVERSE_GUARD_STOP = nil
+    end
+end
+
+G.PSICO_REVERSE_GUARD_STOP = stop
+refreshMenuRefs()
+
+add(RunService.PreSimulation:Connect(function()
+    if not running or not pressureOn() then
+        preForwardSpeed = nil
+        return
+    end
+
+    local _, _, main = getVehicleSeatMain()
+    if main and main:IsDescendantOf(workspace) then
+        preForwardSpeed = main.AssemblyLinearVelocity:Dot(main.CFrame.LookVector)
+    else
+        preForwardSpeed = nil
+    end
+end))
+
+add(RunService.Heartbeat:Connect(function()
+    if not running then return end
+
+    if not versionMarked or not pressureButton or not pressureButton.Parent then
+        refreshMenuRefs()
+    end
+
+    if not pressureOn() then return end
+
+    local vehicle, seat, main = getVehicleSeatMain()
+    if not main or not main:IsDescendantOf(workspace) then return end
+
+    local cf = main.CFrame
+    local nowForward = main.AssemblyLinearVelocity:Dot(cf.LookVector)
+    local before = preForwardSpeed
+    if type(before) ~= "number" then return end
+
+    if not reverseOrNeutral(vehicle, seat, nowForward) then return end
+
+    -- Em R/N/re, nunca permitimos que o frame termine com mais velocidade
+    -- para frente do que tinha antes da simulacao. Assim removemos somente
+    -- o empurrao artificial para frente e preservamos a re natural do jogo.
+    if nowForward > before then
+        local delta = nowForward - before
+        main.AssemblyLinearVelocity = main.AssemblyLinearVelocity - cf.LookVector * delta
+    end
+end))
+
+print("[PSICOSENATICO] Drive World V5.3 carregado")
