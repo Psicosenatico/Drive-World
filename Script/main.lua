@@ -1,5 +1,5 @@
--- PSICOSENATICO | Drive World Vehicle Menu V4
--- Nitro infinito manual + aceleracao + 0 derrape revisado + dirigibilidade alta velocidade.
+-- PSICOSENATICO | Drive World Vehicle Menu V5
+-- Nitro infinito controlado pelo botao manual do jogo + Pressao+ + 0 Derrape + Dirigibilidade.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -25,7 +25,6 @@ local flags = {
     pressure = false,
 }
 
--- Calibracao baseada nos scans do Vulture.
 local TORQUE_MULTIPLIER = 1.65
 local PRESSURE_ACCEL = 58
 local GRIP_MULTIPLIER = 2.15
@@ -36,24 +35,35 @@ local RELEASE_YAW_DAMP_MAX = 25
 local ACTIVE_SLIP_LIMIT = 0.12
 local ACTIVE_EXCESS_DAMP = 8
 
+local TURBO_ACCEL = 92
+local TURBO_MAX_MULTIPLIER = 1.22
+
 local handlingPercent = 0
 
 local currentVehicle
 local currentSeat
 local controller
 local engineConfig
-local nitroResourceTable
 local resolveAccumulator = 999
-local nitroSearchAccumulator = 999
 
 local originalWheelMultiplier = setmetatable({}, {__mode = "k"})
 local originalTorque = setmetatable({}, {__mode = "k"})
 local originalControllerTraction = setmetatable({}, {__mode = "k"})
 local originalSteering = setmetatable({}, {__mode = "k"})
 
+local manualNitroHeld = false
+local nitroStateValue
+local nitroStateConnection
+local nitroButtonsBound = setmetatable({}, {__mode = "k"})
+local nitroButtonCount = 0
+
 local function addConnection(conn)
     connections[#connections + 1] = conn
     return conn
+end
+
+local function normalize(text)
+    return string.lower(tostring(text or "")):gsub("[%s_%-%./]", "")
 end
 
 local function getCharacter()
@@ -124,8 +134,7 @@ end
 local function findController(vehicle)
     if controller and scoreController(controller, vehicle) >= 200 then return controller end
 
-    local best, bestScore
-    bestScore = -1
+    local best, bestScore = nil, -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
             local score = scoreController(obj, vehicle)
@@ -163,8 +172,7 @@ end
 local function findEngine(ctrl)
     if engineConfig and scoreEngine(engineConfig, ctrl) >= 180 then return engineConfig end
 
-    local best, bestScore
-    bestScore = -1
+    local best, bestScore = nil, -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
             local score = scoreEngine(obj, ctrl)
@@ -175,26 +183,6 @@ local function findEngine(ctrl)
     end
     if bestScore >= 180 then return best end
     return nil
-end
-
-local function findNitroResource()
-    if type(nitroResourceTable) == "table" then
-        local v = rawget(nitroResourceTable, "currentNitrousPercent")
-        if type(v) == "number" then return nitroResourceTable end
-    end
-
-    local found
-    for _, obj in ipairs(getGCObjects()) do
-        if type(obj) == "table" then
-            local v = rawget(obj, "currentNitrousPercent")
-            if type(v) == "number" and v >= -0.05 and v <= 1.05 then
-                found = obj
-                break
-            end
-        end
-    end
-    nitroResourceTable = found
-    return found
 end
 
 local function rememberTargets()
@@ -283,6 +271,30 @@ local function restoreHandlingFor(ctrl)
     if info.angleObj and info.angleObj.Parent then pcall(function() info.angleObj.Value = info.angleValue end) end
 end
 
+local function bindNitroState()
+    if nitroStateConnection then
+        pcall(function() nitroStateConnection:Disconnect() end)
+        nitroStateConnection = nil
+    end
+
+    nitroStateValue = nil
+    if not currentVehicle then return end
+
+    local states = currentVehicle:FindFirstChild("States")
+    local value = states and states:FindFirstChild("Nitrous")
+    if value and value:IsA("BoolValue") then
+        nitroStateValue = value
+        nitroStateConnection = value:GetPropertyChangedSignal("Value"):Connect(function()
+            if value.Value and flags.nitroInfinite then
+                manualNitroHeld = true
+            elseif not value.Value and nitroButtonCount == 0 then
+                manualNitroHeld = false
+            end
+        end)
+        connections[#connections + 1] = nitroStateConnection
+    end
+end
+
 local function resolveTargets(force)
     local vehicle, seat = getVehicleAndSeat()
     if vehicle ~= currentVehicle then
@@ -296,7 +308,8 @@ local function resolveTargets(force)
         currentSeat = seat
         controller = nil
         engineConfig = nil
-        nitroResourceTable = nil
+        manualNitroHeld = false
+        bindNitroState()
     else
         currentSeat = seat
     end
@@ -349,12 +362,61 @@ local function getSteerIntent()
     return ctrlValue
 end
 
-local function applyNitroInfinite()
-    if not flags.nitroInfinite then return end
-    local t = findNitroResource()
-    if type(t) == "table" then
-        rawset(t, "currentNitrousPercent", 1)
+local function nitroGuiCandidate(obj)
+    if not obj or not obj:IsA("GuiButton") then return false end
+
+    local screen = obj:FindFirstAncestorOfClass("ScreenGui")
+    if screen and normalize(screen.Name):find("psicodrivemenu", 1, true) then
+        return false
     end
+
+    local name = normalize(obj.Name)
+    local text = ""
+    if obj:IsA("TextButton") then text = normalize(obj.Text) end
+    local combined = name .. text
+
+    return combined:find("nitro", 1, true)
+        or combined:find("nitrous", 1, true)
+        or combined == "nos"
+        or combined:find("boost", 1, true)
+end
+
+local function setManualNitro(value)
+    manualNitroHeld = value and true or false
+
+    if flags.nitroInfinite and nitroStateValue and nitroStateValue.Parent then
+        pcall(function()
+            nitroStateValue.Value = manualNitroHeld
+        end)
+    end
+end
+
+local function bindNitroButton(obj)
+    if nitroButtonsBound[obj] or not nitroGuiCandidate(obj) then return end
+    nitroButtonsBound[obj] = true
+    nitroButtonCount += 1
+
+    addConnection(obj.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            setManualNitro(true)
+        end
+    end))
+
+    addConnection(obj.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            setManualNitro(false)
+        end
+    end))
+end
+
+local function watchNitroButtons(root)
+    if not root then return end
+    for _, obj in ipairs(root:GetDescendants()) do
+        bindNitroButton(obj)
+    end
+    addConnection(root.DescendantAdded:Connect(bindNitroButton))
 end
 
 local function applyGripSettings()
@@ -423,6 +485,26 @@ local function applyPressureAssist(dt, main, cf, forwardSpeed)
     end
 end
 
+local function applyManualTurboAssist(dt, main, cf, forwardSpeed)
+    if not flags.nitroInfinite or not manualNitroHeld then return end
+
+    if nitroStateValue and nitroStateValue.Parent and not nitroStateValue.Value then
+        pcall(function() nitroStateValue.Value = true end)
+    end
+
+    local baseTop = getBaseTopSpeed()
+    local turboCap = baseTop * TURBO_MAX_MULTIPLIER
+    if forwardSpeed >= turboCap then return end
+
+    local taperStart = turboCap * 0.82
+    local factor = 1
+    if forwardSpeed > taperStart then
+        factor = math.clamp((turboCap - forwardSpeed) / math.max(turboCap - taperStart, 1), 0.15, 1)
+    end
+
+    main.AssemblyLinearVelocity += cf.LookVector * (TURBO_ACCEL * factor * dt)
+end
+
 local function applyHandlingAssist(dt, main, cf, speed)
     if handlingPercent <= 0 then return end
     local steer = getSteerIntent()
@@ -460,7 +542,8 @@ local function applyGripAssist(dt, main, cf)
     local speedAlpha = math.clamp(speed / math.max(baseTop, 1), 0, 1.25)
 
     if absSteer < 0.07 then
-        local damp = RELEASE_LATERAL_DAMP_MIN + (RELEASE_LATERAL_DAMP_MAX - RELEASE_LATERAL_DAMP_MIN) * math.clamp(speedAlpha, 0, 1)
+        local damp = RELEASE_LATERAL_DAMP_MIN
+            + (RELEASE_LATERAL_DAMP_MAX - RELEASE_LATERAL_DAMP_MIN) * math.clamp(speedAlpha, 0, 1)
         r *= math.exp(-damp * dt)
         main.AssemblyLinearVelocity = cf.LookVector * f + cf.RightVector * r + cf.UpVector * u
 
@@ -468,7 +551,8 @@ local function applyGripAssist(dt, main, cf)
         local yaw = av:Dot(cf.UpVector)
         local rightA = av:Dot(cf.RightVector)
         local forwardA = av:Dot(cf.LookVector)
-        local yawDamp = RELEASE_YAW_DAMP_MIN + (RELEASE_YAW_DAMP_MAX - RELEASE_YAW_DAMP_MIN) * math.clamp(speedAlpha, 0, 1)
+        local yawDamp = RELEASE_YAW_DAMP_MIN
+            + (RELEASE_YAW_DAMP_MAX - RELEASE_YAW_DAMP_MIN) * math.clamp(speedAlpha, 0, 1)
         yaw *= math.exp(-yawDamp * dt)
         main.AssemblyAngularVelocity = cf.LookVector * forwardA + cf.RightVector * rightA + cf.UpVector * yaw
     else
@@ -486,25 +570,36 @@ end
 local function applyPhysicalAssists(dt)
     local main = getMainPart(currentVehicle)
     if not main or not main:IsDescendantOf(workspace) then return end
+
     local cf = main.CFrame
     local velocity = main.AssemblyLinearVelocity
     local forwardSpeed = velocity:Dot(cf.LookVector)
 
     applyPressureAssist(dt, main, cf, forwardSpeed)
+    applyManualTurboAssist(dt, main, cf, forwardSpeed)
     applyHandlingAssist(dt, main, cf, velocity.Magnitude)
     applyGripAssist(dt, main, cf)
 end
 
--- UI -------------------------------------------------------------------------
-local oldGui = CoreGui:FindFirstChild("PsicoDriveMenuV4") or CoreGui:FindFirstChild("PsicoDriveMenuV3") or CoreGui:FindFirstChild("PsicoDriveMenuV2")
-if not oldGui then
+local function findOldGui()
+    for _, name in ipairs({"PsicoDriveMenuV5", "PsicoDriveMenuV4", "PsicoDriveMenuV3", "PsicoDriveMenuV2"}) do
+        local found = CoreGui:FindFirstChild(name)
+        if found then return found end
+    end
     local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    oldGui = pg and (pg:FindFirstChild("PsicoDriveMenuV4") or pg:FindFirstChild("PsicoDriveMenuV3") or pg:FindFirstChild("PsicoDriveMenuV2"))
+    if pg then
+        for _, name in ipairs({"PsicoDriveMenuV5", "PsicoDriveMenuV4", "PsicoDriveMenuV3", "PsicoDriveMenuV2"}) do
+            local found = pg:FindFirstChild(name)
+            if found then return found end
+        end
+    end
 end
+
+local oldGui = findOldGui()
 if oldGui then pcall(function() oldGui:Destroy() end) end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "PsicoDriveMenuV4"
+gui.Name = "PsicoDriveMenuV5"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = false
 
@@ -512,6 +607,7 @@ local okParent = pcall(function() gui.Parent = CoreGui end)
 if not okParent or not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
 local frame = Instance.new("Frame")
+frame.Name = "Main"
 frame.Size = UDim2.fromOffset(320, 350)
 frame.Position = UDim2.new(0.5, -160, 0.5, -175)
 frame.BackgroundColor3 = Color3.fromRGB(16, 19, 28)
@@ -532,16 +628,28 @@ stroke.Parent = frame
 local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
 title.Position = UDim2.fromOffset(14, 8)
-title.Size = UDim2.new(1, -58, 0, 25)
+title.Size = UDim2.new(1, -94, 0, 25)
 title.Font = Enum.Font.GothamBold
-title.Text = "PSICOSENATICO • DRIVE WORLD V4"
+title.Text = "PSICOSENATICO • DRIVE WORLD V5"
 title.TextColor3 = Color3.fromRGB(240, 242, 255)
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Active = true
 title.Parent = frame
 
+local minimize = Instance.new("TextButton")
+minimize.Name = "Minimize"
+minimize.Size = UDim2.fromOffset(30, 30)
+minimize.Position = UDim2.new(1, -72, 0, 5)
+minimize.BackgroundTransparency = 1
+minimize.Font = Enum.Font.GothamBold
+minimize.Text = "—"
+minimize.TextColor3 = Color3.fromRGB(220, 225, 245)
+minimize.TextSize = 20
+minimize.Parent = frame
+
 local close = Instance.new("TextButton")
+close.Name = "Close"
 close.Size = UDim2.fromOffset(30, 30)
 close.Position = UDim2.new(1, -38, 0, 5)
 close.BackgroundTransparency = 1
@@ -560,9 +668,11 @@ local function makeToggle(y, label)
     button.TextSize = 14
     button.TextColor3 = Color3.new(1, 1, 1)
     button.Parent = frame
+
     local c = Instance.new("UICorner")
     c.CornerRadius = UDim.new(0, 10)
     c.Parent = button
+
     local function paint(on)
         button.Text = label .. ": " .. (on and "ON" or "OFF")
         button.BackgroundColor3 = on and Color3.fromRGB(38, 115, 82) or Color3.fromRGB(70, 75, 92)
@@ -591,6 +701,7 @@ slider.BackgroundColor3 = Color3.fromRGB(52, 57, 72)
 slider.BorderSizePixel = 0
 slider.Active = true
 slider.Parent = frame
+
 local sliderCorner = Instance.new("UICorner")
 sliderCorner.CornerRadius = UDim.new(1, 0)
 sliderCorner.Parent = slider
@@ -600,6 +711,7 @@ fill.Size = UDim2.new(0, 0, 1, 0)
 fill.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
 fill.BorderSizePixel = 0
 fill.Parent = slider
+
 local fillCorner = Instance.new("UICorner")
 fillCorner.CornerRadius = UDim.new(1, 0)
 fillCorner.Parent = fill
@@ -611,6 +723,7 @@ knob.Size = UDim2.fromOffset(22, 22)
 knob.BackgroundColor3 = Color3.fromRGB(235, 238, 250)
 knob.BorderSizePixel = 0
 knob.Parent = slider
+
 local knobCorner = Instance.new("UICorner")
 knobCorner.CornerRadius = UDim.new(1, 0)
 knobCorner.Parent = knob
@@ -627,6 +740,30 @@ status.TextXAlignment = Enum.TextXAlignment.Left
 status.TextYAlignment = Enum.TextYAlignment.Top
 status.Parent = frame
 
+local floating = Instance.new("TextButton")
+floating.Name = "Restore"
+floating.Size = UDim2.fromOffset(48, 48)
+floating.Position = UDim2.new(1, -62, 0.62, 0)
+floating.BackgroundColor3 = Color3.fromRGB(19, 27, 52)
+floating.BorderSizePixel = 0
+floating.Font = Enum.Font.GothamBold
+floating.Text = "DW"
+floating.TextColor3 = Color3.fromRGB(235, 240, 255)
+floating.TextSize = 13
+floating.Visible = false
+floating.Active = true
+floating.Parent = gui
+
+local floatingCorner = Instance.new("UICorner")
+floatingCorner.CornerRadius = UDim.new(1, 0)
+floatingCorner.Parent = floating
+
+local floatingStroke = Instance.new("UIStroke")
+floatingStroke.Thickness = 1
+floatingStroke.Transparency = 0.35
+floatingStroke.Color = Color3.fromRGB(80, 125, 255)
+floatingStroke.Parent = floating
+
 local function refreshUI()
     paintNitro(flags.nitroInfinite)
     paintGrip(flags.grip)
@@ -636,19 +773,21 @@ local function refreshUI()
     knob.Position = UDim2.new(handlingPercent / 100, 0, 0.5, 0)
 
     local car = currentVehicle and currentVehicle.Name or "nenhum"
-    local nitroFound = findNitroResource() and "OK" or "--"
+    local activeNitro = flags.nitroInfinite and manualNitroHeld
     status.Text = string.format(
-        "Carro: %s | Ctrl: %s | Motor: %s | Nitro: %s\nNitro infinito nao ativa sozinho.\n0 derrape libera a curva e estabiliza ao centralizar.",
-        car, controller and "OK" or "--", engineConfig and "OK" or "--", nitroFound
+        "Carro: %s | Ctrl: %s | Motor: %s\nNitro manual: %s | botoes detectados: %d\n0 derrape + dirigibilidade mantidos da V4.",
+        car,
+        controller and "OK" or "--",
+        engineConfig and "OK" or "--",
+        activeNitro and "ATIVO" or (flags.nitroInfinite and "pronto" or "off"),
+        nitroButtonCount
     )
 end
 
 addConnection(nitroButton.MouseButton1Click:Connect(function()
     flags.nitroInfinite = not flags.nitroInfinite
-    if flags.nitroInfinite then
-        nitroResourceTable = nil
-        findNitroResource()
-        applyNitroInfinite()
+    if not flags.nitroInfinite then
+        manualNitroHeld = false
     end
     refreshUI()
 end))
@@ -678,26 +817,34 @@ local function setHandlingFromX(x)
 end
 
 addConnection(slider.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
         sliderDragging = true
         setHandlingFromX(input.Position.X)
     end
 end))
+
 addConnection(slider.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
         sliderDragging = false
     end
 end))
+
 addConnection(UserInputService.InputChanged:Connect(function(input)
-    if sliderDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+    if sliderDragging
+    and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
         setHandlingFromX(input.Position.X)
     end
 end))
 
 local dragging = false
 local dragStart, startPos, dragInput
+
 addConnection(title.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
         startPos = frame.Position
@@ -710,15 +857,79 @@ addConnection(title.InputBegan:Connect(function(input)
         end)
     end
 end))
+
 addConnection(title.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch then
         dragInput = input
     end
 end))
+
 addConnection(UserInputService.InputChanged:Connect(function(input)
     if dragging and input == dragInput and dragStart and startPos then
         local delta = input.Position - dragStart
-        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        frame.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+end))
+
+local function setMinimized(value)
+    frame.Visible = not value
+    floating.Visible = value
+end
+
+addConnection(minimize.MouseButton1Click:Connect(function()
+    setMinimized(true)
+end))
+
+local floatDragging = false
+local floatMoved = false
+local floatStart
+local floatStartPos
+local floatInput
+
+addConnection(floating.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        floatDragging = true
+        floatMoved = false
+        floatStart = input.Position
+        floatStartPos = floating.Position
+    end
+end))
+
+addConnection(floating.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch then
+        floatInput = input
+    end
+end))
+
+addConnection(UserInputService.InputChanged:Connect(function(input)
+    if floatDragging and input == floatInput and floatStart and floatStartPos then
+        local delta = input.Position - floatStart
+        if delta.Magnitude > 5 then floatMoved = true end
+        floating.Position = UDim2.new(
+            floatStartPos.X.Scale,
+            floatStartPos.X.Offset + delta.X,
+            floatStartPos.Y.Scale,
+            floatStartPos.Y.Offset + delta.Y
+        )
+    end
+end))
+
+addConnection(UserInputService.InputEnded:Connect(function(input)
+    if floatDragging
+    and (input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        floatDragging = false
+        if not floatMoved then
+            setMinimized(false)
+        end
     end
 end))
 
@@ -726,6 +937,8 @@ local function restoreAll()
     flags.nitroInfinite = false
     flags.grip = false
     flags.pressure = false
+    manualNitroHeld = false
+
     if controller then
         restoreGripFor(controller)
         restoreHandlingFor(controller)
@@ -737,19 +950,29 @@ local function stop()
     if not running then return end
     running = false
     restoreAll()
-    for _, conn in ipairs(connections) do pcall(function() conn:Disconnect() end) end
+
+    for _, conn in ipairs(connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+
     pcall(function() gui:Destroy() end)
-    if G.PSICO_DRIVE_MENU_STOP == stop then G.PSICO_DRIVE_MENU_STOP = nil end
+
+    if G.PSICO_DRIVE_MENU_STOP == stop then
+        G.PSICO_DRIVE_MENU_STOP = nil
+    end
 end
 
 G.PSICO_DRIVE_MENU_STOP = stop
 addConnection(close.MouseButton1Click:Connect(stop))
 
+local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+watchNitroButtons(playerGui)
+pcall(function() watchNitroButtons(CoreGui) end)
+
 addConnection(RunService.Heartbeat:Connect(function(dt)
     if not running then return end
 
     resolveAccumulator += dt
-    nitroSearchAccumulator += dt
     if resolveAccumulator >= 1 then
         resolveAccumulator = 0
         resolveTargets(false)
@@ -759,16 +982,9 @@ addConnection(RunService.Heartbeat:Connect(function(dt)
         refreshUI()
     end
 
-    if nitroSearchAccumulator >= 1.5 then
-        nitroSearchAccumulator = 0
-        if flags.nitroInfinite and not nitroResourceTable then findNitroResource() end
-    end
-
-    applyNitroInfinite()
     applyPhysicalAssists(dt)
 end))
 
 resolveTargets(true)
-findNitroResource()
 applyHandlingSettings()
 refreshUI()
