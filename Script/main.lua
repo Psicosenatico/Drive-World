@@ -48,6 +48,8 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
     end
 
     -- 2) Indicador de marcha que o proprio controlador fornece ao painel.
+    -- Ele so e usado para bloquear R/N; uma indicacao positiva NAO libera
+    -- o impulso sozinha, evitando usar uma marcha antiga durante a transicao.
     if type(controller) == "table" then
         local instrument = rawget(controller, "instrumentScreen")
         local label = type(instrument) == "table" and rawget(instrument, "currentGearLabel") or nil
@@ -74,15 +76,11 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
             elseif normalized == "n"
             or normalized:find("neutral", 1, true) then
                 neutralConfirmed = true
-            else
-                local displayedGear = tonumber(normalized)
-                if displayedGear and displayedGear > 0 and not reverseConfirmed then
-                    forwardConfirmed = true
-                end
             end
         end
 
-        -- 3) Estado numerico interno como confirmacao adicional.
+        -- 3) Estado numerico interno: somente R/N bloqueiam.
+        -- gear positivo nao confirma frente porque pode estar atrasado.
         local gear = tonumber(rawget(controller, "gear"))
         if gear then
             if gear < 0 then
@@ -94,8 +92,7 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
         end
     end
 
-    -- 4) A propria velocidade longitudinal confirma a direcao depois que
-    -- o carro comeca a se mover. Isso cobre controladores que atrasam a marcha.
+    -- 4) A direcao fisica e a confirmacao principal quando o carro se move.
     if forwardSpeed < -0.75 then
         reverseConfirmed = true
         forwardConfirmed = false
@@ -108,8 +105,8 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
     -- apenas o impulso artificial para frente e bloqueado aqui.
     if reverseConfirmed or neutralConfirmed then return end
 
-    -- Se ainda estamos praticamente parados e nao ha confirmacao clara de
-    -- marcha para frente, esperamos o carro iniciar o movimento naturalmente.
+    -- Parado/ambíguo: nao aplica impulso. Em frente, o carro anda alguns
+    -- centimetros pela fisica original e entao o assistente entra.
     if not forwardConfirmed then return end
     if forwardSpeed < -0.25 then return end
 
