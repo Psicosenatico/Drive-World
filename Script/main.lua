@@ -1,6 +1,5 @@
--- PSICOSENATICO | Drive World Vehicle Menu V3
--- Baseado nos scans do controlador real do Vulture.
--- V3: turbo com impulso fisico, aceleracao mais forte, grip com amortecimento lateral e slider de dirigibilidade.
+-- PSICOSENATICO | Drive World Vehicle Menu V4
+-- Nitro infinito manual + aceleracao + 0 derrape revisado + dirigibilidade alta velocidade.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -13,33 +12,39 @@ local G = (getgenv and getgenv()) or _G
 if type(G.PSICO_DRIVE_MENU_STOP) == "function" then
     pcall(G.PSICO_DRIVE_MENU_STOP)
 end
+if type(G.PSICO_DW_NH_SCAN_STOP) == "function" then
+    pcall(G.PSICO_DW_NH_SCAN_STOP)
+end
 
 local running = true
 local connections = {}
 
 local flags = {
-    turbo = false,
+    nitroInfinite = false,
     grip = false,
     pressure = false,
 }
 
--- Ajustes principais ----------------------------------------------------------
+-- Calibracao baseada nos scans do Vulture.
 local TORQUE_MULTIPLIER = 1.65
-local PRESSURE_ACCEL = 58            -- impulso extra de aceleracao; some perto da velocidade maxima
-local TURBO_ACCEL = 92               -- impulso real do turbo
-local TURBO_MAX_MULTIPLIER = 1.22   -- turbo pode passar da maxima normal em ~22%
-local GRIP_MULTIPLIER = 2.5
-local GRIP_DAMP_ACTIVE = 7.5        -- remove velocidade lateral durante a curva
-local GRIP_DAMP_RELEASE = 17        -- mata a puxadinha lateral ao soltar o esterco
-local YAW_DAMP_RELEASE = 11
+local PRESSURE_ACCEL = 58
+local GRIP_MULTIPLIER = 2.15
+local RELEASE_LATERAL_DAMP_MIN = 18
+local RELEASE_LATERAL_DAMP_MAX = 31
+local RELEASE_YAW_DAMP_MIN = 14
+local RELEASE_YAW_DAMP_MAX = 25
+local ACTIVE_SLIP_LIMIT = 0.12
+local ACTIVE_EXCESS_DAMP = 8
 
-local handlingPercent = 0 -- 0 = original; 100 = esterco mais rapido/forte
+local handlingPercent = 0
 
-local currentVehicle = nil
-local currentSeat = nil
-local controller = nil
-local engineConfig = nil
+local currentVehicle
+local currentSeat
+local controller
+local engineConfig
+local nitroResourceTable
 local resolveAccumulator = 999
+local nitroSearchAccumulator = 999
 
 local originalWheelMultiplier = setmetatable({}, {__mode = "k"})
 local originalTorque = setmetatable({}, {__mode = "k"})
@@ -59,9 +64,7 @@ local function getVehicleAndSeat()
     local char = getCharacter()
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local seat = hum and hum.SeatPart
-    if not seat then
-        return nil, nil
-    end
+    if not seat then return nil, nil end
 
     local cars = workspace:FindFirstChild("Cars")
     if cars then
@@ -120,7 +123,9 @@ end
 
 local function findController(vehicle)
     if controller and scoreController(controller, vehicle) >= 200 then return controller end
-    local best, bestScore = nil, -1
+
+    local best, bestScore
+    bestScore = -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
             local score = scoreController(obj, vehicle)
@@ -157,7 +162,9 @@ end
 
 local function findEngine(ctrl)
     if engineConfig and scoreEngine(engineConfig, ctrl) >= 180 then return engineConfig end
-    local best, bestScore = nil, -1
+
+    local best, bestScore
+    bestScore = -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
             local score = scoreEngine(obj, ctrl)
@@ -168,6 +175,26 @@ local function findEngine(ctrl)
     end
     if bestScore >= 180 then return best end
     return nil
+end
+
+local function findNitroResource()
+    if type(nitroResourceTable) == "table" then
+        local v = rawget(nitroResourceTable, "currentNitrousPercent")
+        if type(v) == "number" then return nitroResourceTable end
+    end
+
+    local found
+    for _, obj in ipairs(getGCObjects()) do
+        if type(obj) == "table" then
+            local v = rawget(obj, "currentNitrousPercent")
+            if type(v) == "number" and v >= -0.05 and v <= 1.05 then
+                found = obj
+                break
+            end
+        end
+    end
+    nitroResourceTable = found
+    return found
 end
 
 local function rememberTargets()
@@ -264,10 +291,12 @@ local function resolveTargets(force)
             restoreHandlingFor(controller)
         end
         if engineConfig then restorePressureFor(engineConfig) end
+
         currentVehicle = vehicle
         currentSeat = seat
         controller = nil
         engineConfig = nil
+        nitroResourceTable = nil
     else
         currentSeat = seat
     end
@@ -293,10 +322,6 @@ local function getBaseTopSpeed()
 
     local calc = rawget(controller, "calculatedTopSpeed")
     if type(calc) == "number" and calc > 0 then return calc end
-
-    local cfg = rawget(controller, "config")
-    local cfgTop = type(cfg) == "table" and rawget(cfg, "TopSpeed") or nil
-    if type(cfgTop) == "number" and cfgTop > 0 then return cfgTop end
     return 280
 end
 
@@ -305,21 +330,30 @@ local function getThrottleIntent()
         local ok, value = pcall(function() return currentSeat.ThrottleFloat end)
         if ok and type(value) == "number" and math.abs(value) > 0.01 then return value end
     end
-
     if type(controller) == "table" then
         local sound = rawget(controller, "engineSound")
-        local t = type(sound) == "table" and rawget(sound, "throttle") or nil
-        if type(t) == "number" then return t end
+        local value = type(sound) == "table" and rawget(sound, "throttle") or nil
+        if type(value) == "number" then return value end
     end
     return 0
 end
 
-local function setNitroVisual(on)
-    if not currentVehicle then return end
-    local states = currentVehicle:FindFirstChild("States")
-    local nitrous = states and states:FindFirstChild("Nitrous")
-    if nitrous and nitrous:IsA("BoolValue") then
-        pcall(function() nitrous.Value = on end)
+local function getSteerIntent()
+    local seatValue = 0
+    if currentSeat and currentSeat:IsA("VehicleSeat") then
+        pcall(function() seatValue = currentSeat.SteerFloat end)
+    end
+    local ctrlValue = type(controller) == "table" and tonumber(rawget(controller, "steerInput")) or 0
+    ctrlValue = ctrlValue or 0
+    if math.abs(seatValue) >= math.abs(ctrlValue) then return seatValue end
+    return ctrlValue
+end
+
+local function applyNitroInfinite()
+    if not flags.nitroInfinite then return end
+    local t = findNitroResource()
+    if type(t) == "table" then
+        rawset(t, "currentNitrousPercent", 1)
     end
 end
 
@@ -361,91 +395,116 @@ local function applyHandlingSettings()
 
     local p = math.clamp(handlingPercent / 100, 0, 1)
     if info.config and info.configAngle then
-        rawset(info.config, "SteerAngle", info.configAngle + (50 - info.configAngle) * p)
+        rawset(info.config, "SteerAngle", info.configAngle + (52 - info.configAngle) * p)
     end
     if info.modObj and info.modObj.Parent then
         local target = info.modValue + (1 - info.modValue) * p
         pcall(function() info.modObj.Value = target end)
     end
     if info.angleObj and info.angleObj.Parent then
-        local target = info.angleValue + (50 - info.angleValue) * p
+        local target = info.angleValue + (52 - info.angleValue) * p
         pcall(function() info.angleObj.Value = target end)
     end
 end
 
-local function applyPhysicalAssist(dt)
-    local main = getMainPart(currentVehicle)
-    if not main or not main:IsDescendantOf(workspace) then return end
-
-    local cf = main.CFrame
-    local velocity = main.AssemblyLinearVelocity
-    local forwardSpeed = velocity:Dot(cf.LookVector)
+local function applyPressureAssist(dt, main, cf, forwardSpeed)
+    if not flags.pressure then return end
     local throttle = getThrottleIntent()
+    if throttle <= 0.04 or forwardSpeed < -1 then return end
+
     local baseTop = getBaseTopSpeed()
-
-    -- PRESSAO+: mantem o ganho de torque que permitiu chegar na maxima,
-    -- mas adiciona aceleracao extra que desaparece perto da maxima normal.
-    if flags.pressure and throttle > 0.04 and forwardSpeed >= -1 then
-        local startTaper = baseTop * 0.68
-        local factor = 1
-        if forwardSpeed > startTaper then
-            factor = math.clamp((baseTop - forwardSpeed) / math.max(baseTop - startTaper, 1), 0, 1)
-        end
-        if factor > 0 then
-            local dv = PRESSURE_ACCEL * factor * dt
-            main.AssemblyLinearVelocity += cf.LookVector * dv
-        end
+    local startTaper = baseTop * 0.68
+    local factor = 1
+    if forwardSpeed > startTaper then
+        factor = math.clamp((baseTop - forwardSpeed) / math.max(baseTop - startTaper, 1), 0, 1)
     end
-
-    -- TURBO REAL: o Bool States.Nitrous sozinho e so estado/efeito.
-    -- Aqui o turbo acrescenta velocidade fisica e tem limite acima da maxima normal.
-    if flags.turbo and (throttle > 0.04 or forwardSpeed > 8) then
-        local turboCap = baseTop * TURBO_MAX_MULTIPLIER
-        if forwardSpeed < turboCap then
-            local taperStart = turboCap * 0.82
-            local factor = forwardSpeed <= taperStart
-                and 1
-                or math.clamp((turboCap - forwardSpeed) / math.max(turboCap - taperStart, 1), 0.15, 1)
-            local dv = TURBO_ACCEL * factor * dt
-            main.AssemblyLinearVelocity += cf.LookVector * dv
-        end
+    if factor > 0 then
+        main.AssemblyLinearVelocity += cf.LookVector * (PRESSURE_ACCEL * factor * dt)
     end
+end
 
-    -- 0 DERRAPE: nao basta aumentar tractionMultiplier; tambem e preciso
-    -- remover a velocidade lateral residual que causa a "puxadinha" apos a curva.
-    if flags.grip then
-        local v = main.AssemblyLinearVelocity
-        local f = v:Dot(cf.LookVector)
-        local r = v:Dot(cf.RightVector)
-        local u = v:Dot(cf.UpVector)
-        local steerInput = type(controller) == "table" and tonumber(rawget(controller, "steerInput")) or 0
-        steerInput = steerInput or 0
+local function applyHandlingAssist(dt, main, cf, speed)
+    if handlingPercent <= 0 then return end
+    local steer = getSteerIntent()
+    if math.abs(steer) < 0.06 then return end
 
-        local damp = math.abs(steerInput) < 0.08 and GRIP_DAMP_RELEASE or GRIP_DAMP_ACTIVE
+    local baseTop = getBaseTopSpeed()
+    local p = math.clamp(handlingPercent / 100, 0, 1)
+    local highSpeed = math.clamp((speed - 65) / math.max(baseTop * 0.65, 1), 0, 1)
+    local strength = p * highSpeed
+    if strength <= 0 then return end
+
+    local av = main.AssemblyAngularVelocity
+    local currentYaw = av:Dot(cf.UpVector)
+    local forwardA = av:Dot(cf.LookVector)
+    local rightA = av:Dot(cf.RightVector)
+
+    local targetYaw = -steer * (0.85 + 0.75 * highSpeed) * (0.55 + 0.45 * p)
+    local alpha = 1 - math.exp(-(4 + 7 * strength) * dt)
+    local newYaw = currentYaw + (targetYaw - currentYaw) * alpha
+
+    main.AssemblyAngularVelocity = cf.LookVector * forwardA + cf.RightVector * rightA + cf.UpVector * newYaw
+end
+
+local function applyGripAssist(dt, main, cf)
+    if not flags.grip then return end
+
+    local v = main.AssemblyLinearVelocity
+    local f = v:Dot(cf.LookVector)
+    local r = v:Dot(cf.RightVector)
+    local u = v:Dot(cf.UpVector)
+    local speed = v.Magnitude
+    local steer = getSteerIntent()
+    local absSteer = math.abs(steer)
+    local baseTop = getBaseTopSpeed()
+    local speedAlpha = math.clamp(speed / math.max(baseTop, 1), 0, 1.25)
+
+    if absSteer < 0.07 then
+        local damp = RELEASE_LATERAL_DAMP_MIN + (RELEASE_LATERAL_DAMP_MAX - RELEASE_LATERAL_DAMP_MIN) * math.clamp(speedAlpha, 0, 1)
         r *= math.exp(-damp * dt)
         main.AssemblyLinearVelocity = cf.LookVector * f + cf.RightVector * r + cf.UpVector * u
 
-        if math.abs(steerInput) < 0.08 then
-            local av = main.AssemblyAngularVelocity
-            local yaw = av:Dot(cf.UpVector)
-            local rightA = av:Dot(cf.RightVector)
-            local forwardA = av:Dot(cf.LookVector)
-            yaw *= math.exp(-YAW_DAMP_RELEASE * dt)
-            main.AssemblyAngularVelocity = cf.LookVector * forwardA + cf.RightVector * rightA + cf.UpVector * yaw
+        local av = main.AssemblyAngularVelocity
+        local yaw = av:Dot(cf.UpVector)
+        local rightA = av:Dot(cf.RightVector)
+        local forwardA = av:Dot(cf.LookVector)
+        local yawDamp = RELEASE_YAW_DAMP_MIN + (RELEASE_YAW_DAMP_MAX - RELEASE_YAW_DAMP_MIN) * math.clamp(speedAlpha, 0, 1)
+        yaw *= math.exp(-yawDamp * dt)
+        main.AssemblyAngularVelocity = cf.LookVector * forwardA + cf.RightVector * rightA + cf.UpVector * yaw
+    else
+        local allowed = math.max(4, math.abs(f) * ACTIVE_SLIP_LIMIT)
+        local absR = math.abs(r)
+        if absR > allowed then
+            local excess = absR - allowed
+            local retained = excess * math.exp(-ACTIVE_EXCESS_DAMP * dt)
+            r = (r < 0 and -1 or 1) * (allowed + retained)
+            main.AssemblyLinearVelocity = cf.LookVector * f + cf.RightVector * r + cf.UpVector * u
         end
     end
 end
 
+local function applyPhysicalAssists(dt)
+    local main = getMainPart(currentVehicle)
+    if not main or not main:IsDescendantOf(workspace) then return end
+    local cf = main.CFrame
+    local velocity = main.AssemblyLinearVelocity
+    local forwardSpeed = velocity:Dot(cf.LookVector)
+
+    applyPressureAssist(dt, main, cf, forwardSpeed)
+    applyHandlingAssist(dt, main, cf, velocity.Magnitude)
+    applyGripAssist(dt, main, cf)
+end
+
 -- UI -------------------------------------------------------------------------
-local oldGui = CoreGui:FindFirstChild("PsicoDriveMenuV3") or CoreGui:FindFirstChild("PsicoDriveMenuV2")
+local oldGui = CoreGui:FindFirstChild("PsicoDriveMenuV4") or CoreGui:FindFirstChild("PsicoDriveMenuV3") or CoreGui:FindFirstChild("PsicoDriveMenuV2")
 if not oldGui then
     local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    oldGui = pg and (pg:FindFirstChild("PsicoDriveMenuV3") or pg:FindFirstChild("PsicoDriveMenuV2"))
+    oldGui = pg and (pg:FindFirstChild("PsicoDriveMenuV4") or pg:FindFirstChild("PsicoDriveMenuV3") or pg:FindFirstChild("PsicoDriveMenuV2"))
 end
 if oldGui then pcall(function() oldGui:Destroy() end) end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "PsicoDriveMenuV3"
+gui.Name = "PsicoDriveMenuV4"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = false
 
@@ -453,8 +512,8 @@ local okParent = pcall(function() gui.Parent = CoreGui end)
 if not okParent or not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(320, 342)
-frame.Position = UDim2.new(0.5, -160, 0.5, -171)
+frame.Size = UDim2.fromOffset(320, 350)
+frame.Position = UDim2.new(0.5, -160, 0.5, -175)
 frame.BackgroundColor3 = Color3.fromRGB(16, 19, 28)
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -475,10 +534,11 @@ title.BackgroundTransparency = 1
 title.Position = UDim2.fromOffset(14, 8)
 title.Size = UDim2.new(1, -58, 0, 25)
 title.Font = Enum.Font.GothamBold
-title.Text = "PSICOSENATICO • DRIVE WORLD V3"
+title.Text = "PSICOSENATICO • DRIVE WORLD V4"
 title.TextColor3 = Color3.fromRGB(240, 242, 255)
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
+title.Active = true
 title.Parent = frame
 
 local close = Instance.new("TextButton")
@@ -510,7 +570,7 @@ local function makeToggle(y, label)
     return button, paint
 end
 
-local turboButton, paintTurbo = makeToggle(42, "TURBO REAL INFINITO")
+local nitroButton, paintNitro = makeToggle(42, "NITRO INFINITO")
 local gripButton, paintGrip = makeToggle(90, "0 DERRAPE")
 local pressureButton, paintPressure = makeToggle(138, "PRESSAO +")
 
@@ -558,17 +618,17 @@ knobCorner.Parent = knob
 local status = Instance.new("TextLabel")
 status.BackgroundTransparency = 1
 status.Position = UDim2.fromOffset(14, 252)
-status.Size = UDim2.new(1, -28, 0, 74)
+status.Size = UDim2.new(1, -28, 0, 82)
 status.Font = Enum.Font.Gotham
 status.TextColor3 = Color3.fromRGB(165, 172, 195)
-status.TextSize = 12
+status.TextSize = 11
 status.TextWrapped = true
 status.TextXAlignment = Enum.TextXAlignment.Left
 status.TextYAlignment = Enum.TextYAlignment.Top
 status.Parent = frame
 
 local function refreshUI()
-    paintTurbo(flags.turbo)
+    paintNitro(flags.nitroInfinite)
     paintGrip(flags.grip)
     paintPressure(flags.pressure)
     handlingLabel.Text = string.format("DIRIGIBILIDADE / ESTERCO: %d%%", handlingPercent)
@@ -576,16 +636,20 @@ local function refreshUI()
     knob.Position = UDim2.new(handlingPercent / 100, 0, 0.5, 0)
 
     local car = currentVehicle and currentVehicle.Name or "nenhum"
+    local nitroFound = findNitroResource() and "OK" or "--"
     status.Text = string.format(
-        "Carro: %s   Controlador: %s   Motor: %s\nTurbo: impulso fisico | Pressao: torque + aceleracao\nGrip: tracao + corte de velocidade lateral",
-        car, controller and "OK" or "--", engineConfig and "OK" or "--"
+        "Carro: %s | Ctrl: %s | Motor: %s | Nitro: %s\nNitro infinito nao ativa sozinho.\n0 derrape libera a curva e estabiliza ao centralizar.",
+        car, controller and "OK" or "--", engineConfig and "OK" or "--", nitroFound
     )
 end
 
-addConnection(turboButton.MouseButton1Click:Connect(function()
-    flags.turbo = not flags.turbo
-    resolveTargets(true)
-    setNitroVisual(flags.turbo)
+addConnection(nitroButton.MouseButton1Click:Connect(function()
+    flags.nitroInfinite = not flags.nitroInfinite
+    if flags.nitroInfinite then
+        nitroResourceTable = nil
+        findNitroResource()
+        applyNitroInfinite()
+    end
     refreshUI()
 end))
 
@@ -603,7 +667,6 @@ addConnection(pressureButton.MouseButton1Click:Connect(function()
     refreshUI()
 end))
 
--- Slider de dirigibilidade ----------------------------------------------------
 local sliderDragging = false
 local function setHandlingFromX(x)
     local width = slider.AbsoluteSize.X
@@ -631,7 +694,6 @@ addConnection(UserInputService.InputChanged:Connect(function(input)
     end
 end))
 
--- Arrastar menu somente pelo cabecalho, evitando conflito com o slider.
 local dragging = false
 local dragStart, startPos, dragInput
 addConnection(title.InputBegan:Connect(function(input)
@@ -661,10 +723,9 @@ addConnection(UserInputService.InputChanged:Connect(function(input)
 end))
 
 local function restoreAll()
-    flags.turbo = false
+    flags.nitroInfinite = false
     flags.grip = false
     flags.pressure = false
-    setNitroVisual(false)
     if controller then
         restoreGripFor(controller)
         restoreHandlingFor(controller)
@@ -688,6 +749,7 @@ addConnection(RunService.Heartbeat:Connect(function(dt)
     if not running then return end
 
     resolveAccumulator += dt
+    nitroSearchAccumulator += dt
     if resolveAccumulator >= 1 then
         resolveAccumulator = 0
         resolveTargets(false)
@@ -697,10 +759,16 @@ addConnection(RunService.Heartbeat:Connect(function(dt)
         refreshUI()
     end
 
-    if flags.turbo then setNitroVisual(true) end
-    applyPhysicalAssist(dt)
+    if nitroSearchAccumulator >= 1.5 then
+        nitroSearchAccumulator = 0
+        if flags.nitroInfinite and not nitroResourceTable then findNitroResource() end
+    end
+
+    applyNitroInfinite()
+    applyPhysicalAssists(dt)
 end))
 
 resolveTargets(true)
+findNitroResource()
 applyHandlingSettings()
 refreshUI()
