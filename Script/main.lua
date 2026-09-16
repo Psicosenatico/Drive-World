@@ -1,201 +1,383 @@
--- PSICOSENATICO | Infinite Turbo Menu
--- Cliente adaptativo: procura valores/atributos comuns de nitro/turbo no carro atual.
+-- PSICOSENATICO | Drive World Vehicle Menu V2
+-- Construido a partir dos scans focados do controlador do carro.
+-- Recursos: Turbo infinito, Zero Deslize e Pressao+ (torque).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local G = (getgenv and getgenv()) or _G
 
-if type(G.PSICO_TURBO_STOP) == "function" then
-    pcall(G.PSICO_TURBO_STOP)
+if type(G.PSICO_DRIVE_MENU_STOP) == "function" then
+    pcall(G.PSICO_DRIVE_MENU_STOP)
 end
 
-local enabled = true
 local running = true
 local connections = {}
-local touched = setmetatable({}, {__mode = "k"})
-local touchedAttributes = setmetatable({}, {__mode = "k"})
-local targetCount = 0
-local RESOURCE_VALUE = 1000000
+
+local flags = {
+    turbo = false,
+    grip = false,
+    pressure = false,
+}
+
+local GRIP_MULTIPLIER = 4
+local TORQUE_MULTIPLIER = 1.65
+
+local currentVehicle = nil
+local controller = nil
+local engineConfig = nil
+local resolveAccumulator = 999
+
+local originalWheelMultiplier = setmetatable({}, {__mode = "k"})
+local originalTorque = setmetatable({}, {__mode = "k"})
+local originalControllerTraction = setmetatable({}, {__mode = "k"})
 
 local function addConnection(conn)
     connections[#connections + 1] = conn
     return conn
 end
 
-local function normalize(text)
-    return string.lower(tostring(text or "")):gsub("[%s_%-%./]", "")
-end
-
-local function isTurboKey(name)
-    local n = normalize(name)
-    if n == "nitro" or n == "turbo" or n == "boost" or n == "nos" then
-        return true
-    end
-
-    if not (n:find("nitro", 1, true) or n:find("turbo", 1, true) or n:find("boost", 1, true) or n:find("nos", 1, true)) then
-        return false
-    end
-
-    -- Evita transformar potência/velocidade do veículo em valores absurdos.
-    if n:find("power", 1, true)
-    or n:find("force", 1, true)
-    or n:find("speed", 1, true)
-    or n:find("torque", 1, true)
-    or n:find("multiplier", 1, true)
-    or n:find("mult", 1, true) then
-        return false
-    end
-
-    return n:find("amount", 1, true)
-        or n:find("fuel", 1, true)
-        or n:find("charge", 1, true)
-        or n:find("capacity", 1, true)
-        or n:find("level", 1, true)
-        or n:find("meter", 1, true)
-        or n:find("time", 1, true)
-        or n:find("duration", 1, true)
-        or n:find("remaining", 1, true)
-        or n:find("left", 1, true)
-        or n:find("value", 1, true)
-        or n:find("current", 1, true)
-        or n:find("max", 1, true)
-end
-
 local function getCharacter()
     return LocalPlayer.Character
 end
 
-local function getVehicle()
-    local character = getCharacter()
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local seat = humanoid and humanoid.SeatPart
-
-    if seat then
-        local model = seat:FindFirstAncestorOfClass("Model")
-        if model then
-            return model
-        end
-        return seat.Parent
+local function getCurrentVehicle()
+    local char = getCharacter()
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local seat = hum and hum.SeatPart
+    if not seat then
+        return nil
     end
 
+    local cars = workspace:FindFirstChild("Cars")
+    if cars then
+        local node = seat
+        while node and node.Parent and node.Parent ~= cars do
+            node = node.Parent
+        end
+        if node and node.Parent == cars and node:IsA("Model") then
+            return node
+        end
+    end
+
+    local node = seat
+    while node and node ~= workspace do
+        if node:IsA("Model")
+        and node:FindFirstChild("Main")
+        and node:FindFirstChild("Wheels") then
+            return node
+        end
+        node = node.Parent
+    end
+
+    return seat:FindFirstAncestorOfClass("Model")
+end
+
+local function getGCObjects()
+    local fn = rawget(G, "getgc") or getgc
+    if type(fn) ~= "function" then
+        return {}
+    end
+
+    local ok, result = pcall(fn, true)
+    if not ok or type(result) ~= "table" then
+        ok, result = pcall(fn)
+    end
+
+    if ok and type(result) == "table" then
+        return result
+    end
+    return {}
+end
+
+local function scoreController(t, vehicle)
+    if type(t) ~= "table" or not vehicle then
+        return -1
+    end
+
+    local score = 0
+    local model = rawget(t, "model")
+    local carName = rawget(t, "carName")
+    local wheelData = rawget(t, "wheelData")
+    local config = rawget(t, "config")
+
+    if model == vehicle then score += 140 end
+    if carName == vehicle.Name then score += 35 end
+    if type(wheelData) == "table" then score += 35 end
+    if type(config) == "table" then score += 25 end
+    if type(rawget(t, "engineSound")) == "table" then score += 20 end
+    if rawget(t, "currentDriver") == LocalPlayer then score += 45 end
+    if rawget(t, "owner") == LocalPlayer then score += 20 end
+
+    return score
+end
+
+local function findController(vehicle)
+    if controller and scoreController(controller, vehicle) >= 200 then
+        return controller
+    end
+
+    local best, bestScore = nil, -1
+    for _, obj in ipairs(getGCObjects()) do
+        if type(obj) == "table" then
+            local score = scoreController(obj, vehicle)
+            if score > bestScore then
+                bestScore = score
+                best = obj
+            end
+        end
+    end
+
+    if bestScore >= 180 then
+        return best
+    end
     return nil
 end
 
-local function markObject(obj)
-    if not touched[obj] then
-        touched[obj] = true
-        targetCount += 1
+local function scoreEngine(t, ctrl)
+    if type(t) ~= "table" or type(ctrl) ~= "table" then
+        return -1
     end
+
+    local curve = rawget(t, "TorqueCurve")
+    if type(curve) ~= "table" then
+        return -1
+    end
+
+    local score = 15
+    local selected = rawget(t, "selectedMods")
+    local config = rawget(ctrl, "config")
+    local stockEngine = type(config) == "table" and rawget(config, "StockEngine") or nil
+
+    if type(selected) == "table" then
+        score += 25
+        if stockEngine and rawget(selected, "Profile") == stockEngine then
+            score += 160
+        end
+    end
+
+    if type(rawget(t, "GetTorqueAtRPM")) == "function" then score += 35 end
+    if type(rawget(t, "GetMaxTorque")) == "function" then score += 20 end
+    if type(rawget(t, "GetMaxPower")) == "function" then score += 20 end
+    if type(rawget(t, "ApplyUpgradesFromTuning")) == "function" then score += 20 end
+
+    local soundProfile = rawget(ctrl, "soundProfile")
+    if soundProfile and rawget(t, "SoundProfile") == soundProfile then
+        score += 12
+    end
+
+    return score
 end
 
-local function patchValueObject(obj)
-    if not isTurboKey(obj.Name) then
-        return
+local function findEngine(ctrl)
+    if engineConfig and scoreEngine(engineConfig, ctrl) >= 180 then
+        return engineConfig
     end
 
-    if obj:IsA("NumberValue") or obj:IsA("IntValue") then
-        markObject(obj)
-        pcall(function()
-            if obj.Value < RESOURCE_VALUE then
-                obj.Value = RESOURCE_VALUE
+    local best, bestScore = nil, -1
+    for _, obj in ipairs(getGCObjects()) do
+        if type(obj) == "table" then
+            local score = scoreEngine(obj, ctrl)
+            if score > bestScore then
+                bestScore = score
+                best = obj
             end
-        end)
-    elseif obj:IsA("BoolValue") then
-        markObject(obj)
-        pcall(function()
-            obj.Value = true
-        end)
+        end
     end
+
+    if bestScore >= 180 then
+        return best
+    end
+    return nil
 end
 
-local function patchAttributes(obj)
-    local ok, attrs = pcall(function()
-        return obj:GetAttributes()
-    end)
-    if not ok or type(attrs) ~= "table" then
-        return
-    end
-
-    for key, value in pairs(attrs) do
-        if isTurboKey(key) then
-            touchedAttributes[obj] = touchedAttributes[obj] or {}
-            if not touchedAttributes[obj][key] then
-                touchedAttributes[obj][key] = true
-                targetCount += 1
-            end
-
+local function rememberTarget()
+    if type(controller) == "table" then
+        if originalControllerTraction[controller] == nil then
+            local value = rawget(controller, "traction")
             if type(value) == "number" then
-                pcall(function()
-                    if value < RESOURCE_VALUE then
-                        obj:SetAttribute(key, RESOURCE_VALUE)
-                    end
-                end)
-            elseif type(value) == "boolean" then
-                pcall(function()
-                    obj:SetAttribute(key, true)
-                end)
+                originalControllerTraction[controller] = value
             end
+        end
+
+        local wheels = rawget(controller, "wheelData")
+        if type(wheels) == "table" then
+            for _, wheel in pairs(wheels) do
+                if type(wheel) == "table"
+                and originalWheelMultiplier[wheel] == nil then
+                    local mult = rawget(wheel, "tractionMultiplier")
+                    if type(mult) == "number" then
+                        originalWheelMultiplier[wheel] = mult
+                    end
+                end
+            end
+        end
+    end
+
+    if type(engineConfig) == "table" and originalTorque[engineConfig] == nil then
+        local curve = rawget(engineConfig, "TorqueCurve")
+        if type(curve) == "table" then
+            local copy = {}
+            for k, value in pairs(curve) do
+                if type(value) == "number" then
+                    copy[k] = value
+                end
+            end
+            originalTorque[engineConfig] = copy
         end
     end
 end
 
-local function patchObject(obj)
-    patchValueObject(obj)
-    patchAttributes(obj)
-end
+local function resolveTargets(force)
+    local vehicle = getCurrentVehicle()
 
-local function scanRoot(root)
-    if not root then
+    if vehicle ~= currentVehicle then
+        currentVehicle = vehicle
+        controller = nil
+        engineConfig = nil
+    end
+
+    if not currentVehicle then
         return
     end
 
-    patchObject(root)
-    for _, obj in ipairs(root:GetDescendants()) do
-        patchObject(obj)
+    if force or not controller then
+        controller = findController(currentVehicle)
+    end
+
+    if controller and (force or not engineConfig) then
+        engineConfig = findEngine(controller)
+    end
+
+    rememberTarget()
+end
+
+local function setTurboState(value)
+    local vehicle = currentVehicle or getCurrentVehicle()
+    if not vehicle then return end
+
+    local states = vehicle:FindFirstChild("States")
+    local nitrous = states and states:FindFirstChild("Nitrous")
+    if nitrous and nitrous:IsA("BoolValue") then
+        pcall(function()
+            nitrous.Value = value
+        end)
     end
 end
 
-local function applyInfiniteTurbo()
-    if not enabled then
+local function applyGrip()
+    if type(controller) ~= "table" then
         return
     end
 
-    scanRoot(LocalPlayer)
-    scanRoot(getCharacter())
-    scanRoot(getVehicle())
+    local wheels = rawget(controller, "wheelData")
+    if type(wheels) == "table" then
+        for _, wheel in pairs(wheels) do
+            if type(wheel) == "table" then
+                local original = originalWheelMultiplier[wheel]
+                if flags.grip then
+                    rawset(wheel, "tractionMultiplier", GRIP_MULTIPLIER)
+                elseif original ~= nil then
+                    rawset(wheel, "tractionMultiplier", original)
+                end
+            end
+        end
+    end
+
+    if flags.grip then
+        rawset(controller, "traction", 1)
+    end
+end
+
+local function restoreGrip()
+    if type(controller) ~= "table" then
+        return
+    end
+
+    local wheels = rawget(controller, "wheelData")
+    if type(wheels) == "table" then
+        for _, wheel in pairs(wheels) do
+            if type(wheel) == "table" then
+                local original = originalWheelMultiplier[wheel]
+                if original ~= nil then
+                    rawset(wheel, "tractionMultiplier", original)
+                end
+            end
+        end
+    end
+
+    local originalTraction = originalControllerTraction[controller]
+    if originalTraction ~= nil then
+        rawset(controller, "traction", originalTraction)
+    end
+end
+
+local function applyPressure()
+    if type(engineConfig) ~= "table" then
+        return
+    end
+
+    local originals = originalTorque[engineConfig]
+    local curve = rawget(engineConfig, "TorqueCurve")
+    if type(originals) ~= "table" or type(curve) ~= "table" then
+        return
+    end
+
+    for key, base in pairs(originals) do
+        if flags.pressure then
+            curve[key] = base * TORQUE_MULTIPLIER
+        else
+            curve[key] = base
+        end
+    end
+end
+
+local function restorePressure()
+    if type(engineConfig) ~= "table" then
+        return
+    end
+
+    local originals = originalTorque[engineConfig]
+    local curve = rawget(engineConfig, "TorqueCurve")
+    if type(originals) ~= "table" or type(curve) ~= "table" then
+        return
+    end
+
+    for key, base in pairs(originals) do
+        curve[key] = base
+    end
 end
 
 -- UI -------------------------------------------------------------------------
-local oldGui
-pcall(function()
-    oldGui = game:GetService("CoreGui"):FindFirstChild("PsicoInfiniteTurbo")
-end)
-if not oldGui and LocalPlayer:FindFirstChildOfClass("PlayerGui") then
-    oldGui = LocalPlayer.PlayerGui:FindFirstChild("PsicoInfiniteTurbo")
+
+local oldGui = CoreGui:FindFirstChild("PsicoDriveMenuV2")
+if not oldGui then
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    oldGui = pg and pg:FindFirstChild("PsicoDriveMenuV2")
 end
 if oldGui then
     pcall(function() oldGui:Destroy() end)
 end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "PsicoInfiniteTurbo"
+gui.Name = "PsicoDriveMenuV2"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = false
 
-local parented = pcall(function()
-    gui.Parent = game:GetService("CoreGui")
+local okParent = pcall(function()
+    gui.Parent = CoreGui
 end)
-if not parented or not gui.Parent then
+if not okParent or not gui.Parent then
     gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 end
 
 local frame = Instance.new("Frame")
 frame.Name = "Main"
-frame.Size = UDim2.fromOffset(260, 126)
-frame.Position = UDim2.new(0.5, -130, 0.72, -63)
+frame.Size = UDim2.fromOffset(310, 258)
+frame.Position = UDim2.new(0.5, -155, 0.5, -129)
 frame.BackgroundColor3 = Color3.fromRGB(16, 19, 28)
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -208,7 +390,7 @@ corner.Parent = frame
 local stroke = Instance.new("UIStroke")
 stroke.Thickness = 1
 stroke.Transparency = 0.35
-stroke.Color = Color3.fromRGB(90, 130, 255)
+stroke.Color = Color3.fromRGB(80, 125, 255)
 stroke.Parent = frame
 
 local title = Instance.new("TextLabel")
@@ -216,7 +398,7 @@ title.BackgroundTransparency = 1
 title.Position = UDim2.fromOffset(14, 8)
 title.Size = UDim2.new(1, -58, 0, 25)
 title.Font = Enum.Font.GothamBold
-title.Text = "PSICOSENATICO • TURBO"
+title.Text = "PSICOSENATICO • DRIVE WORLD"
 title.TextColor3 = Color3.fromRGB(240, 242, 255)
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
@@ -232,50 +414,95 @@ close.TextColor3 = Color3.fromRGB(220, 225, 245)
 close.TextSize = 22
 close.Parent = frame
 
-local toggle = Instance.new("TextButton")
-toggle.Size = UDim2.new(1, -28, 0, 44)
-toggle.Position = UDim2.fromOffset(14, 42)
-toggle.BorderSizePixel = 0
-toggle.Font = Enum.Font.GothamBold
-toggle.TextSize = 15
-toggle.TextColor3 = Color3.new(1, 1, 1)
-toggle.Parent = frame
+local function makeToggle(y, label)
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(1, -28, 0, 44)
+    button.Position = UDim2.fromOffset(14, y)
+    button.BorderSizePixel = 0
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 14
+    button.TextColor3 = Color3.new(1, 1, 1)
+    button.AutoButtonColor = true
+    button.Parent = frame
 
-local toggleCorner = Instance.new("UICorner")
-toggleCorner.CornerRadius = UDim.new(0, 10)
-toggleCorner.Parent = toggle
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent = button
+
+    local function paint(on, suffix)
+        button.Text = label .. ": " .. (on and "ON" or "OFF") .. (suffix or "")
+        button.BackgroundColor3 = on
+            and Color3.fromRGB(38, 115, 82)
+            or Color3.fromRGB(70, 75, 92)
+    end
+
+    return button, paint
+end
+
+local turboButton, paintTurbo = makeToggle(42, "TURBO INFINITO")
+local gripButton, paintGrip = makeToggle(92, "0 DESLIZE")
+local pressureButton, paintPressure = makeToggle(142, "PRESSAO +")
 
 local status = Instance.new("TextLabel")
 status.BackgroundTransparency = 1
-status.Position = UDim2.fromOffset(14, 91)
-status.Size = UDim2.new(1, -28, 0, 24)
+status.Position = UDim2.fromOffset(14, 195)
+status.Size = UDim2.new(1, -28, 0, 50)
 status.Font = Enum.Font.Gotham
 status.TextColor3 = Color3.fromRGB(165, 172, 195)
 status.TextSize = 12
+status.TextWrapped = true
 status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
 status.Parent = frame
 
 local function refreshUI()
-    if enabled then
-        toggle.Text = "TURBO INFINITO: ON"
-        toggle.BackgroundColor3 = Color3.fromRGB(38, 115, 82)
-        status.Text = string.format("Ativo • alvos detectados: %d", targetCount)
-    else
-        toggle.Text = "TURBO INFINITO: OFF"
-        toggle.BackgroundColor3 = Color3.fromRGB(95, 49, 57)
-        status.Text = string.format("Pausado • alvos detectados: %d", targetCount)
-    end
+    paintTurbo(flags.turbo)
+    paintGrip(flags.grip, flags.grip and "  • 4x grip" or "")
+    paintPressure(flags.pressure, flags.pressure and "  • 1.65x torque" or "")
+
+    local car = currentVehicle and currentVehicle.Name or "nenhum"
+    local c = controller and "OK" or "--"
+    local e = engineConfig and "OK" or "--"
+    status.Text = string.format(
+        "Carro: %s\nControlador: %s   Motor: %s",
+        car, c, e
+    )
 end
 
-addConnection(toggle.MouseButton1Click:Connect(function()
-    enabled = not enabled
-    if enabled then
-        applyInfiniteTurbo()
+addConnection(turboButton.MouseButton1Click:Connect(function()
+    flags.turbo = not flags.turbo
+    if flags.turbo then
+        resolveTargets(true)
+        setTurboState(true)
+    else
+        setTurboState(false)
     end
     refreshUI()
 end))
 
--- Arrastar no mouse/toque.
+addConnection(gripButton.MouseButton1Click:Connect(function()
+    flags.grip = not flags.grip
+    resolveTargets(true)
+    if flags.grip then
+        applyGrip()
+    else
+        restoreGrip()
+    end
+    refreshUI()
+end))
+
+addConnection(pressureButton.MouseButton1Click:Connect(function()
+    flags.pressure = not flags.pressure
+    resolveTargets(true)
+    if flags.pressure then
+        applyPressure()
+    else
+        restorePressure()
+    end
+    refreshUI()
+end))
+
+-- Arrastar por mouse ou toque.
 do
     local dragging = false
     local dragStart
@@ -319,43 +546,59 @@ do
     end))
 end
 
-local accumulator = 0
-addConnection(RunService.Heartbeat:Connect(function(dt)
-    if not running then
-        return
-    end
-    accumulator += dt
-    if accumulator >= 0.08 then
-        accumulator = 0
-        applyInfiniteTurbo()
-        refreshUI()
-    end
-end))
+local function restoreAll()
+    flags.turbo = false
+    flags.grip = false
+    flags.pressure = false
+
+    setTurboState(false)
+    restoreGrip()
+    restorePressure()
+end
 
 local function stop()
-    if not running then
-        return
-    end
+    if not running then return end
     running = false
-    enabled = false
+    restoreAll()
 
     for _, conn in ipairs(connections) do
         pcall(function() conn:Disconnect() end)
     end
-    table.clear(connections)
 
     pcall(function()
-        if gui then gui:Destroy() end
+        gui:Destroy()
     end)
 
-    if G.PSICO_TURBO_STOP == stop then
-        G.PSICO_TURBO_STOP = nil
+    if G.PSICO_DRIVE_MENU_STOP == stop then
+        G.PSICO_DRIVE_MENU_STOP = nil
     end
 end
 
-G.PSICO_TURBO_STOP = stop
-
+G.PSICO_DRIVE_MENU_STOP = stop
 addConnection(close.MouseButton1Click:Connect(stop))
 
-applyInfiniteTurbo()
+addConnection(RunService.Heartbeat:Connect(function(dt)
+    if not running then return end
+
+    resolveAccumulator += dt
+    if resolveAccumulator >= 1 then
+        resolveAccumulator = 0
+        resolveTargets(false)
+        refreshUI()
+    end
+
+    if flags.turbo then
+        setTurboState(true)
+    end
+
+    if flags.grip then
+        applyGrip()
+    end
+
+    if flags.pressure then
+        applyPressure()
+    end
+end))
+
+resolveTargets(true)
 refreshUI()
