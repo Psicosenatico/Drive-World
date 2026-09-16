@@ -1,6 +1,6 @@
--- PSICOSENATICO | Drive World Vehicle Menu V5.2
--- Hotfix revisado: Pressao+ nunca injeta impulso para frente durante re/neutral.
--- Usa o indicador de marcha do proprio carro + gear + direcao fisica antes de aplicar assistencia.
+-- PSICOSENATICO | Drive World Vehicle Menu V5.2.1
+-- Loader fix: usa substituicao por funcao para preservar '%' no bloco inserido.
+-- Pressao+ continua bloqueado em re/neutral e so auxilia quando frente esta confirmada.
 
 local CORE_URL = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/8a326ee9a89d7080667d5a4a40ddfc6506a1869b/Script/main.lua"
 local source = game:HttpGet(CORE_URL)
@@ -27,14 +27,11 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
     local throttle = getThrottleIntent()
     if math.abs(throttle) <= 0.04 then return end
 
-    -- O scan do Vulture mostrou uma relacao de re dedicada em gears[-1]
-    -- e cachedGears[-1]. Nao usamos apenas controller.gear porque o scan
-    -- anterior nao mediu uma manobra de re e esse campo pode atualizar tarde.
     local reverseConfirmed = false
     local forwardConfirmed = false
     local neutralConfirmed = false
 
-    -- 1) Entrada nativa do assento, quando o jogo usa VehicleSeat.
+    -- 1) VehicleSeat: quando disponivel, a entrada negativa confirma re.
     if currentSeat and currentSeat:IsA("VehicleSeat") then
         local seatThrottle
         pcall(function() seatThrottle = currentSeat.ThrottleFloat end)
@@ -47,9 +44,8 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
         end
     end
 
-    -- 2) Indicador de marcha que o proprio controlador fornece ao painel.
-    -- Ele so e usado para bloquear R/N; uma indicacao positiva NAO libera
-    -- o impulso sozinha, evitando usar uma marcha antiga durante a transicao.
+    -- 2) Indicador de marcha do proprio carro: usado para BLOQUEAR R/N.
+    -- Marcha positiva nao libera impulso sozinha, porque pode estar atrasada.
     if type(controller) == "table" then
         local instrument = rawget(controller, "instrumentScreen")
         local label = type(instrument) == "table" and rawget(instrument, "currentGearLabel") or nil
@@ -79,8 +75,7 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
             end
         end
 
-        -- 3) Estado numerico interno: somente R/N bloqueiam.
-        -- gear positivo nao confirma frente porque pode estar atrasado.
+        -- 3) Estado numerico interno: apenas -1/negativo e 0 sao usados para bloquear.
         local gear = tonumber(rawget(controller, "gear"))
         if gear then
             if gear < 0 then
@@ -92,7 +87,7 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
         end
     end
 
-    -- 4) A direcao fisica e a confirmacao principal quando o carro se move.
+    -- 4) Direcao fisica do carro: confirmacao principal depois que ele comeca a andar.
     if forwardSpeed < -0.75 then
         reverseConfirmed = true
         forwardConfirmed = false
@@ -100,13 +95,10 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
         forwardConfirmed = true
     end
 
-    -- Pressao+ deixa re e neutro inteiramente para a fisica original do jogo.
-    -- O aumento de TorqueCurve continua sendo tratado pelo controlador normal;
-    -- apenas o impulso artificial para frente e bloqueado aqui.
+    -- Em re ou neutro, o impulso artificial do Pressao+ fica totalmente desligado.
     if reverseConfirmed or neutralConfirmed then return end
 
-    -- Parado/ambíguo: nao aplica impulso. Em frente, o carro anda alguns
-    -- centimetros pela fisica original e entao o assistente entra.
+    -- Parado/ambiguo: espera a fisica original iniciar o movimento para frente.
     if not forwardConfirmed then return end
     if forwardSpeed < -0.25 then return end
 
@@ -126,20 +118,25 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
     end
 end]]
 
-local patched, replacements = source:gsub(oldBlock, newBlock, 1)
+-- IMPORTANTE: replacement por funcao evita que '%' do codigo novo seja
+-- interpretado pelo string.gsub como referencia de captura.
+local patched, replacements = source:gsub(oldBlock, function()
+    return newBlock
+end, 1)
+
 if replacements ~= 1 then
-    error("Drive World V5.2 hotfix: bloco Pressao+ nao encontrado")
+    error("Drive World V5.2.1 hotfix: bloco Pressao+ nao encontrado")
 end
 
--- Marcacao visual clara para confirmar que a revisao nova foi carregada.
 patched = patched:gsub(
     "PSICOSENATICO • DRIVE WORLD V5",
-    "PSICOSENATICO • DRIVE WORLD V5.2",
+    "PSICOSENATICO • DRIVE WORLD V5.2.1",
     1
 )
 
 local fn, err = loadstring(patched)
 if not fn then
-    error("Drive World V5.2 compile error: " .. tostring(err))
+    error("Drive World V5.2.1 compile error: " .. tostring(err))
 end
+
 return fn()
