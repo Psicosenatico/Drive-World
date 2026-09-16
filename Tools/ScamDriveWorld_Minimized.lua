@@ -229,7 +229,7 @@ end
 
 G.PSICO_SCAM_MIN_STOP = stop
 
-local originalUrl = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/main/Scam%20Drive%20World"
+local originalUrl = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/0594fd24c7d113c3c985c65170ab6a12646d07a3/Scam%20Drive%20World"
 local source = game:HttpGet(originalUrl)
 local fn, err = loadstring(source)
 if not fn then
