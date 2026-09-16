@@ -1,5 +1,5 @@
--- PSICOSENATICO | Drive World Vehicle Menu V5.4
--- Base V5.3.1 + barra de forca do freio baseada no estado real controller.isBraking.
+-- PSICOSENATICO | Drive World Vehicle Menu V5.5
+-- Base V5.4 preservada; PRESSAO+ refeita para usar pedal real + marcha real.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -9,53 +9,59 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local G = (getgenv and getgenv()) or _G
 
-if type(G.PSICO_DRIVE_V54_STOP) == "function" then
-    pcall(G.PSICO_DRIVE_V54_STOP)
+if type(G.PSICO_DRIVE_V55_STOP) == "function" then
+    pcall(G.PSICO_DRIVE_V55_STOP)
 end
 
--- Carrega a V5.3.1 que ja esta funcionando: Nitro, 0 Derrape,
--- Pressao+, Dirigibilidade e minimizar permanecem nela.
-local BASE_URL = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/2d8282c5fe14023512d44458da5e0af6576987c1/Script/main.lua"
+-- Mantem tudo que ja ficou aprovado na V5.4, inclusive a barra de freio.
+local BASE_URL = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/f6def77bf8c71106c35104e9fd1c38eff845ebe8/Script/main.lua"
 local okSource, baseSource = pcall(function()
     return game:HttpGet(BASE_URL)
 end)
 if not okSource or type(baseSource) ~= "string" or #baseSource < 1000 then
-    error("Drive World V5.4: falha ao baixar a base V5.3.1")
+    error("Drive World V5.5: falha ao baixar a base V5.4")
 end
 
 local baseFn, compileError = loadstring(baseSource)
 if not baseFn then
-    error("Drive World V5.4: base V5.3.1 nao compilou: " .. tostring(compileError))
+    error("Drive World V5.5: base V5.4 nao compilou: " .. tostring(compileError))
 end
 
 local okBase, baseError = pcall(baseFn)
 if not okBase then
-    error("Drive World V5.4: base V5.3.1 falhou: " .. tostring(baseError))
+    error("Drive World V5.5: base V5.4 falhou: " .. tostring(baseError))
 end
 
 local running = true
 local connections = {}
-local brakePercent = 0
+local pressureEnabled = false
 local currentVehicle = nil
 local currentSeat = nil
 local controller = nil
+local engineConfig = nil
 local resolveTimer = 999
 local menuGui = nil
-local menuFrame = nil
-local brakePanel = nil
-local originalFrameSize = nil
-local statusLabel = nil
-local originalStatusPosition = nil
-local originalStatusSize = nil
+local originalPressureButton = nil
+local customPressureButton = nil
 
--- Assistencia adicional. 0% nao altera nada; 100% acrescenta
--- amortecimento longitudinal forte somente enquanto o jogo esta freando.
-local BRAKE_EXTRA_DAMP_MAX = 9
+local TORQUE_MULTIPLIER = 1.65
+local PRESSURE_ACCEL = 58
+local originalTorque = setmetatable({}, {__mode = "k"})
+
+-- Pedal real da interface. O scan nao mostrou throttle confiavel no controller,
+-- entao o estado do toque e usado como fonte principal no mobile.
+local accelButtonsBound = setmetatable({}, {__mode = "k"})
+local activeAccelInputs = setmetatable({}, {__mode = "k"})
+local accelButtonCount = 0
 
 local function connect(signal, fn)
     local c = signal:Connect(fn)
     connections[#connections + 1] = c
     return c
+end
+
+local function normalize(text)
+    return string.lower(tostring(text or "")):gsub("[%s_%-%./]", "")
 end
 
 local function getVehicleAndSeat()
@@ -114,7 +120,9 @@ local function scoreController(t, vehicle)
     if rawget(t, "currentDriver") == LocalPlayer then score = score + 50 end
     if rawget(t, "owner") == LocalPlayer then score = score + 20 end
     if type(rawget(t, "wheelData")) == "table" then score = score + 30 end
-    if rawget(t, "isBraking") ~= nil then score = score + 20 end
+    if type(rawget(t, "config")) == "table" then score = score + 20 end
+    if type(rawget(t, "engineSound")) == "table" then score = score + 15 end
+    if rawget(t, "gear") ~= nil then score = score + 20 end
     return score
 end
 
@@ -134,71 +142,301 @@ local function findController(vehicle)
     return nil
 end
 
+local function scoreEngine(t, ctrl)
+    if type(t) ~= "table" or type(ctrl) ~= "table" then return -1 end
+    if type(rawget(t, "TorqueCurve")) ~= "table" then return -1 end
+
+    local score = 15
+    local selected = rawget(t, "selectedMods")
+    local config = rawget(ctrl, "config")
+    local stockEngine = type(config) == "table" and rawget(config, "StockEngine") or nil
+
+    if type(selected) == "table" then
+        score = score + 25
+        if stockEngine and rawget(selected, "Profile") == stockEngine then
+            score = score + 160
+        end
+    end
+    if type(rawget(t, "GetTorqueAtRPM")) == "function" then score = score + 35 end
+    if type(rawget(t, "GetMaxTorque")) == "function" then score = score + 20 end
+    if type(rawget(t, "GetMaxPower")) == "function" then score = score + 20 end
+    return score
+end
+
+local function findEngine(ctrl)
+    if engineConfig and scoreEngine(engineConfig, ctrl) >= 180 then return engineConfig end
+
+    local best, bestScore = nil, -1
+    for _, obj in ipairs(getGCObjects()) do
+        if type(obj) == "table" then
+            local score = scoreEngine(obj, ctrl)
+            if score > bestScore then
+                best, bestScore = obj, score
+            end
+        end
+    end
+    if bestScore >= 180 then return best end
+    return nil
+end
+
+local function rememberTorque(engine)
+    if type(engine) ~= "table" or originalTorque[engine] ~= nil then return end
+    local curve = rawget(engine, "TorqueCurve")
+    if type(curve) ~= "table" then return end
+
+    local copy = {}
+    for k, v in pairs(curve) do
+        if type(v) == "number" then copy[k] = v end
+    end
+    originalTorque[engine] = copy
+end
+
+local function applyTorque(engine)
+    if type(engine) ~= "table" then return end
+    rememberTorque(engine)
+
+    local saved = originalTorque[engine]
+    local curve = rawget(engine, "TorqueCurve")
+    if type(saved) ~= "table" or type(curve) ~= "table" then return end
+
+    for k, v in pairs(saved) do
+        curve[k] = pressureEnabled and (v * TORQUE_MULTIPLIER) or v
+    end
+end
+
+local function restoreTorque(engine)
+    if type(engine) ~= "table" then return end
+    local saved = originalTorque[engine]
+    local curve = rawget(engine, "TorqueCurve")
+    if type(saved) ~= "table" or type(curve) ~= "table" then return end
+    for k, v in pairs(saved) do curve[k] = v end
+end
+
 local function resolveTargets(force)
     local vehicle, seat = getVehicleAndSeat()
     if vehicle ~= currentVehicle then
+        if engineConfig then restoreTorque(engineConfig) end
         currentVehicle = vehicle
         currentSeat = seat
         controller = nil
+        engineConfig = nil
     else
         currentSeat = seat
     end
 
-    if currentVehicle and (force or not controller) then
-        controller = findController(currentVehicle)
-    end
+    if not currentVehicle then return end
+    if force or not controller then controller = findController(currentVehicle) end
+    if controller and (force or not engineConfig) then engineConfig = findEngine(controller) end
+
+    if engineConfig then applyTorque(engineConfig) end
 end
 
-local function isBrakePressed(forwardSpeed)
-    -- Fonte principal confirmada pelo scan do controlador.
-    if type(controller) == "table" then
-        local state = rawget(controller, "isBraking")
-        if type(state) == "boolean" then
-            return state
-        end
-    end
+local function getGearText()
+    if type(controller) ~= "table" then return nil end
+    local screen = rawget(controller, "instrumentScreen")
+    local label = type(screen) == "table" and rawget(screen, "currentGearLabel") or nil
+    local text = nil
 
-    -- Fallback apenas se o controlador nao expuser isBraking.
-    -- Throttle negativo so conta como freio quando o carro ainda esta
-    -- deslocando-se para frente, para nao atrapalhar a re.
-    if currentSeat and currentSeat:IsA("VehicleSeat") and forwardSpeed > 1 then
-        local ok, throttle = pcall(function()
-            return currentSeat.ThrottleFloat
+    if typeof(label) == "Instance" then
+        pcall(function()
+            if label:IsA("TextLabel") or label:IsA("TextButton") or label:IsA("TextBox") then
+                text = label.Text
+            end
         end)
-        if ok and type(throttle) == "number" then
-            return throttle < -0.04
+    elseif type(label) == "string" then
+        text = label
+    end
+
+    if type(text) == "string" then
+        return normalize(text)
+    end
+    return nil
+end
+
+local function getGearDirection()
+    local text = getGearText()
+    if text then
+        if text == "r" or text == "re" or text == "ré" or text:find("reverse", 1, true) then
+            return -1
+        end
+        if text == "n" or text:find("neutral", 1, true) then
+            return 0
+        end
+        local n = tonumber(text)
+        if n then
+            if n < 0 then return -1 end
+            if n > 0 then return 1 end
+            return 0
         end
     end
 
+    if type(controller) == "table" then
+        local gear = tonumber(rawget(controller, "gear"))
+        if gear then
+            if gear < 0 then return -1 end
+            if gear > 0 then return 1 end
+            return 0
+        end
+    end
+
+    return 0
+end
+
+local function getSpeedCap(direction)
+    if type(controller) ~= "table" then
+        return direction < 0 and 45 or 280
+    end
+
+    local cached = rawget(controller, "cachedGears")
+    local tops = type(cached) == "table" and rawget(cached, "topSpeeds") or nil
+    if type(tops) == "table" then
+        if direction < 0 then
+            for k, v in pairs(tops) do
+                if (k == -1 or tostring(k) == "-1") and type(v) == "number" then
+                    return math.max(math.abs(v), 10)
+                end
+            end
+        else
+            local maxSpeed = 0
+            for k, v in pairs(tops) do
+                if type(v) == "number" and tonumber(k) and tonumber(k) > 0 and v > maxSpeed then
+                    maxSpeed = v
+                end
+            end
+            if maxSpeed > 0 then return maxSpeed end
+        end
+    end
+
+    local calc = rawget(controller, "calculatedTopSpeed")
+    if direction > 0 and type(calc) == "number" and calc > 0 then return calc end
+    return direction < 0 and 45 or 280
+end
+
+local function accelCandidate(obj)
+    if not obj or not obj:IsA("GuiButton") then return false end
+
+    local screen = obj:FindFirstAncestorOfClass("ScreenGui")
+    if screen and normalize(screen.Name):find("psicodrivemenu", 1, true) then
+        return false
+    end
+
+    local parts = {obj.Name}
+    if obj:IsA("TextButton") then parts[#parts + 1] = obj.Text end
+
+    local node = obj.Parent
+    for _ = 1, 4 do
+        if not node then break end
+        parts[#parts + 1] = node.Name
+        node = node.Parent
+    end
+
+    local text = normalize(table.concat(parts, " "))
+    local keywords = {
+        "accelerate", "accel", "accelerator", "acelerar", "acelerador",
+        "throttle", "gas", "forward", "gaspedal", "pedalgas"
+    }
+
+    for _, word in ipairs(keywords) do
+        if text:find(word, 1, true) then return true end
+    end
     return false
 end
 
-local function applyBrakeAssist(dt)
-    if brakePercent <= 0 then return end
-    if not currentVehicle or not controller then return end
+local function updateAccelHeld()
+    return next(activeAccelInputs) ~= nil
+end
+
+local function bindAccelButton(obj)
+    if accelButtonsBound[obj] or not accelCandidate(obj) then return end
+    accelButtonsBound[obj] = true
+    accelButtonCount = accelButtonCount + 1
+
+    connect(obj.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            activeAccelInputs[input] = true
+        end
+    end)
+
+    connect(obj.InputEnded, function(input)
+        activeAccelInputs[input] = nil
+    end)
+end
+
+local function watchAccelButtons(root)
+    if not root then return end
+    for _, obj in ipairs(root:GetDescendants()) do
+        bindAccelButton(obj)
+    end
+    connect(root.DescendantAdded, bindAccelButton)
+end
+
+local function keyboardOrGamepadForward()
+    local okW, w = pcall(function() return UserInputService:IsKeyDown(Enum.KeyCode.W) end)
+    if okW and w then return true end
+    local okUp, up = pcall(function() return UserInputService:IsKeyDown(Enum.KeyCode.Up) end)
+    if okUp and up then return true end
+
+    local okPad, pad = pcall(function()
+        return UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonR2)
+    end)
+    return okPad and pad or false
+end
+
+local function seatThrottleActive(direction)
+    if not currentSeat or not currentSeat:IsA("VehicleSeat") then return false end
+    local ok, throttle = pcall(function() return currentSeat.ThrottleFloat end)
+    if not ok or type(throttle) ~= "number" then return false end
+
+    if direction > 0 then return throttle > 0.04 end
+    return math.abs(throttle) > 0.04
+end
+
+local function driveInputActive(direction)
+    if updateAccelHeld() then return true end
+    if seatThrottleActive(direction) then return true end
+
+    if direction > 0 then
+        return keyboardOrGamepadForward()
+    end
+
+    -- No Drive World a re passa pelo estado de frenagem/retrocesso.
+    if type(controller) == "table" and rawget(controller, "isBraking") == true then
+        return true
+    end
+    return false
+end
+
+local function applyPressureAssist(dt)
+    if not pressureEnabled or not currentVehicle or not controller then return end
+
+    local direction = getGearDirection()
+    if direction == 0 then return end
+    if not driveInputActive(direction) then return end
 
     local main = getMainPart(currentVehicle)
     if not main or not main:IsDescendantOf(workspace) then return end
 
     local cf = main.CFrame
-    local velocity = main.AssemblyLinearVelocity
-    local forward = velocity:Dot(cf.LookVector)
+    local forwardSpeed = main.AssemblyLinearVelocity:Dot(cf.LookVector)
+    local directionalSpeed = forwardSpeed * direction
+    local cap = getSpeedCap(direction)
+    if directionalSpeed >= cap then return end
 
-    if not isBrakePressed(forward) then return end
+    local startTaper = cap * 0.68
+    local factor = 1
+    if directionalSpeed > startTaper then
+        factor = math.clamp(
+            (cap - directionalSpeed) / math.max(cap - startTaper, 1),
+            0,
+            1
+        )
+    end
 
-    local right = velocity:Dot(cf.RightVector)
-    local up = velocity:Dot(cf.UpVector)
-    local p = math.clamp(brakePercent / 100, 0, 1)
-    local damp = BRAKE_EXTRA_DAMP_MAX * p
-
-    -- Aproxima a velocidade longitudinal de zero sem inverter o sentido.
-    local newForward = forward * math.exp(-damp * dt)
-    if math.abs(newForward) < 0.08 then newForward = 0 end
-
-    main.AssemblyLinearVelocity =
-        cf.LookVector * newForward
-        + cf.RightVector * right
-        + cf.UpVector * up
+    if factor > 0 then
+        main.AssemblyLinearVelocity = main.AssemblyLinearVelocity
+            + cf.LookVector * (PRESSURE_ACCEL * factor * dt * direction)
+    end
 end
 
 local function locateMenu()
@@ -212,170 +450,86 @@ local function locateMenu()
     return nil
 end
 
-local function installBrakeUI()
+local function locateVisiblePressureButton(root)
+    if not root then return nil end
+    for _, obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("TextButton") and obj.Visible then
+            local text = string.upper(tostring(obj.Text or ""))
+            if text:find("PRESSAO", 1, true) then return obj end
+        end
+    end
+    return nil
+end
+
+local function installPressureOverride()
     menuGui = locateMenu()
-    if not menuGui then
-        error("Drive World V5.4: menu base nao encontrado")
-    end
+    if not menuGui then error("Drive World V5.5: menu base nao encontrado") end
 
-    menuFrame = menuGui:FindFirstChild("Main")
-    if not menuFrame or not menuFrame:IsA("Frame") then
-        error("Drive World V5.4: frame principal nao encontrado")
-    end
-
-    -- Marcacao visual da revisao.
     for _, obj in ipairs(menuGui:GetDescendants()) do
         if obj:IsA("TextLabel") and tostring(obj.Text):find("DRIVE WORLD V5", 1, true) then
-            obj.Text = "PSICOSENATICO • DRIVE WORLD V5.4"
+            obj.Text = "PSICOSENATICO • DRIVE WORLD V5.5"
             break
         end
     end
 
-    -- Localiza o status para abrir somente o espaco necessario para a nova barra.
-    for _, obj in ipairs(menuFrame:GetChildren()) do
-        if obj:IsA("TextLabel") and tostring(obj.Text):find("Carro:", 1, true) then
-            statusLabel = obj
-            break
-        end
+    originalPressureButton = locateVisiblePressureButton(menuGui)
+    if not originalPressureButton then
+        error("Drive World V5.5: botao PRESSAO+ base nao encontrado")
     end
 
-    originalFrameSize = menuFrame.Size
-    menuFrame.Size = UDim2.fromOffset(320, 390)
+    originalPressureButton.Visible = false
 
-    if statusLabel then
-        originalStatusPosition = statusLabel.Position
-        originalStatusSize = statusLabel.Size
-        statusLabel.Position = UDim2.fromOffset(14, 300)
-        statusLabel.Size = UDim2.new(1, -28, 0, 72)
-    end
+    local button = originalPressureButton:Clone()
+    button.Name = "PressureV55"
+    button.Visible = true
+    button.Text = "PRESSAO +: OFF"
+    button.ZIndex = originalPressureButton.ZIndex + 20
+    button.Parent = originalPressureButton.Parent
+    customPressureButton = button
 
-    brakePanel = Instance.new("Frame")
-    brakePanel.Name = "BrakeStrengthV54"
-    brakePanel.BackgroundTransparency = 1
-    brakePanel.Position = UDim2.fromOffset(14, 246)
-    brakePanel.Size = UDim2.new(1, -28, 0, 48)
-    brakePanel.Parent = menuFrame
+    connect(button.MouseButton1Click, function()
+        pressureEnabled = not pressureEnabled
+        button.Text = pressureEnabled and "PRESSAO +: ON" or "PRESSAO +: OFF"
+        button.BackgroundColor3 = pressureEnabled
+            and Color3.fromRGB(38, 115, 82)
+            or Color3.fromRGB(70, 75, 92)
 
-    local label = Instance.new("TextLabel")
-    label.Name = "BrakeLabel"
-    label.BackgroundTransparency = 1
-    label.Position = UDim2.fromOffset(0, 0)
-    label.Size = UDim2.new(1, 0, 0, 20)
-    label.Font = Enum.Font.GothamBold
-    label.TextColor3 = Color3.fromRGB(230, 233, 245)
-    label.TextSize = 12
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = brakePanel
-
-    local slider = Instance.new("Frame")
-    slider.Name = "BrakeSlider"
-    slider.Position = UDim2.fromOffset(0, 28)
-    slider.Size = UDim2.new(1, 0, 0, 16)
-    slider.BackgroundColor3 = Color3.fromRGB(52, 57, 72)
-    slider.BorderSizePixel = 0
-    slider.Active = true
-    slider.Parent = brakePanel
-
-    local sliderCorner = Instance.new("UICorner")
-    sliderCorner.CornerRadius = UDim.new(1, 0)
-    sliderCorner.Parent = slider
-
-    local fill = Instance.new("Frame")
-    fill.Name = "Fill"
-    fill.Size = UDim2.new(0, 0, 1, 0)
-    fill.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
-    fill.BorderSizePixel = 0
-    fill.Parent = slider
-
-    local fillCorner = Instance.new("UICorner")
-    fillCorner.CornerRadius = UDim.new(1, 0)
-    fillCorner.Parent = fill
-
-    local knob = Instance.new("Frame")
-    knob.Name = "Knob"
-    knob.AnchorPoint = Vector2.new(0.5, 0.5)
-    knob.Position = UDim2.new(0, 0, 0.5, 0)
-    knob.Size = UDim2.fromOffset(22, 22)
-    knob.BackgroundColor3 = Color3.fromRGB(235, 238, 250)
-    knob.BorderSizePixel = 0
-    knob.Parent = slider
-
-    local knobCorner = Instance.new("UICorner")
-    knobCorner.CornerRadius = UDim.new(1, 0)
-    knobCorner.Parent = knob
-
-    local function refresh()
-        label.Text = string.format("FORCA DO FREIO: %d%%", brakePercent)
-        fill.Size = UDim2.new(brakePercent / 100, 0, 1, 0)
-        knob.Position = UDim2.new(brakePercent / 100, 0, 0.5, 0)
-    end
-
-    local dragging = false
-    local function setFromX(x)
-        local width = slider.AbsoluteSize.X
-        if width <= 0 then return end
-        local alpha = math.clamp((x - slider.AbsolutePosition.X) / width, 0, 1)
-        brakePercent = math.floor(alpha * 100 + 0.5)
-        refresh()
-    end
-
-    connect(slider.InputBegan, function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            setFromX(input.Position.X)
-        end
+        resolveTargets(true)
+        if engineConfig then applyTorque(engineConfig) end
     end)
-
-    connect(slider.InputEnded, function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-
-    connect(UserInputService.InputChanged, function(input)
-        if dragging and (
-            input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch
-        ) then
-            setFromX(input.Position.X)
-        end
-    end)
-
-    refresh()
 end
 
 local function stop()
     if not running then return end
     running = false
-    brakePercent = 0
+    pressureEnabled = false
+
+    if engineConfig then restoreTorque(engineConfig) end
+
+    if originalPressureButton and originalPressureButton.Parent then
+        pcall(function() originalPressureButton.Visible = true end)
+    end
+    if customPressureButton and customPressureButton.Parent then
+        pcall(function() customPressureButton:Destroy() end)
+    end
 
     for _, c in ipairs(connections) do
         pcall(function() c:Disconnect() end)
     end
 
-    if brakePanel and brakePanel.Parent then
-        pcall(function() brakePanel:Destroy() end)
-    end
-
-    if menuFrame and menuFrame.Parent and originalFrameSize then
-        pcall(function() menuFrame.Size = originalFrameSize end)
-    end
-    if statusLabel and statusLabel.Parent then
-        if originalStatusPosition then pcall(function() statusLabel.Position = originalStatusPosition end) end
-        if originalStatusSize then pcall(function() statusLabel.Size = originalStatusSize end) end
-    end
-
-    if G.PSICO_DRIVE_V54_STOP == stop then
-        G.PSICO_DRIVE_V54_STOP = nil
+    if G.PSICO_DRIVE_V55_STOP == stop then
+        G.PSICO_DRIVE_V55_STOP = nil
     end
 end
 
-G.PSICO_DRIVE_V54_STOP = stop
+G.PSICO_DRIVE_V55_STOP = stop
 
-installBrakeUI()
+installPressureOverride()
 resolveTargets(true)
+
+local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+watchAccelButtons(playerGui)
+pcall(function() watchAccelButtons(CoreGui) end)
 
 connect(RunService.Heartbeat, function(dt)
     if not running then return end
@@ -384,6 +538,7 @@ connect(RunService.Heartbeat, function(dt)
     if resolveTimer >= 1 then
         resolveTimer = 0
         resolveTargets(false)
+        if engineConfig then applyTorque(engineConfig) end
 
         if menuGui and not menuGui.Parent then
             stop()
@@ -391,5 +546,5 @@ connect(RunService.Heartbeat, function(dt)
         end
     end
 
-    applyBrakeAssist(dt)
+    applyPressureAssist(dt)
 end)
