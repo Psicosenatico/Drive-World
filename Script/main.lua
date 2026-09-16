@@ -1,6 +1,6 @@
--- PSICOSENATICO | Drive World Vehicle Menu V5.3
--- Base: V5 original comprovadamente funcional.
--- Correcao: PRESSAO+ substituido por implementacao independente, sem patch/gsub em runtime.
+-- PSICOSENATICO | Drive World Vehicle Menu V5.3.1
+-- Hotfix: PRESSAO+ so aplica impulso enquanto o acelerador estiver realmente pressionado.
+-- Mantem a V5 funcional como base, protecao de re/neutral e demais funcoes aprovadas.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -9,6 +9,7 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local G = (getgenv and getgenv()) or _G
 
+-- Encerra somente o complemento V5.3 anterior antes de carregar a base.
 if type(G.PSICO_DRIVE_V53_STOP) == "function" then
     pcall(G.PSICO_DRIVE_V53_STOP)
 end
@@ -18,17 +19,17 @@ local okSource, baseSource = pcall(function()
     return game:HttpGet(BASE_URL)
 end)
 if not okSource or type(baseSource) ~= "string" or #baseSource < 1000 then
-    error("Drive World V5.3: falha ao baixar a base V5")
+    error("Drive World V5.3.1: falha ao baixar a base V5")
 end
 
 local baseFn, baseCompileError = loadstring(baseSource)
 if not baseFn then
-    error("Drive World V5.3: base V5 nao compilou: " .. tostring(baseCompileError))
+    error("Drive World V5.3.1: base V5 nao compilou: " .. tostring(baseCompileError))
 end
 
 local okBase, baseRunError = pcall(baseFn)
 if not okBase then
-    error("Drive World V5.3: base V5 falhou: " .. tostring(baseRunError))
+    error("Drive World V5.3.1: base V5 falhou: " .. tostring(baseRunError))
 end
 
 local running = true
@@ -46,6 +47,7 @@ local menuGui = nil
 local TORQUE_MULTIPLIER = 1.65
 local PRESSURE_ACCEL = 58
 local START_FORWARD_ASSIST = 0.75
+local THROTTLE_THRESHOLD = 0.04
 
 local originalTorque = setmetatable({}, {__mode = "k"})
 
@@ -118,6 +120,7 @@ end
 
 local function findController(vehicle)
     if controller and scoreController(controller, vehicle) >= 200 then return controller end
+
     local best, bestScore = nil, -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
@@ -134,10 +137,12 @@ end
 local function scoreEngine(t, ctrl)
     if type(t) ~= "table" or type(ctrl) ~= "table" then return -1 end
     if type(rawget(t, "TorqueCurve")) ~= "table" then return -1 end
+
     local score = 15
     local selected = rawget(t, "selectedMods")
     local config = rawget(ctrl, "config")
     local stockEngine = type(config) == "table" and rawget(config, "StockEngine") or nil
+
     if type(selected) == "table" then
         score = score + 25
         if stockEngine and rawget(selected, "Profile") == stockEngine then score = score + 160 end
@@ -151,6 +156,7 @@ end
 
 local function findEngine(ctrl)
     if engineConfig and scoreEngine(engineConfig, ctrl) >= 180 then return engineConfig end
+
     local best, bestScore = nil, -1
     for _, obj in ipairs(getGCObjects()) do
         if type(obj) == "table" then
@@ -168,6 +174,7 @@ local function rememberTorque(engine)
     if type(engine) ~= "table" or originalTorque[engine] ~= nil then return end
     local curve = rawget(engine, "TorqueCurve")
     if type(curve) ~= "table" then return end
+
     local copy = {}
     for k, v in pairs(curve) do
         if type(v) == "number" then copy[k] = v end
@@ -186,9 +193,11 @@ end
 local function applyTorque(engine)
     if type(engine) ~= "table" then return end
     rememberTorque(engine)
+
     local saved = originalTorque[engine]
     local curve = rawget(engine, "TorqueCurve")
     if type(saved) ~= "table" or type(curve) ~= "table" then return end
+
     for k, v in pairs(saved) do
         curve[k] = pressureEnabled and (v * TORQUE_MULTIPLIER) or v
     end
@@ -205,9 +214,11 @@ local function resolveTargets(force)
     else
         currentSeat = seat
     end
+
     if not currentVehicle then return end
     if force or not controller then controller = findController(currentVehicle) end
     if controller and (force or not engineConfig) then engineConfig = findEngine(controller) end
+
     if engineConfig then
         rememberTorque(engineConfig)
         applyTorque(engineConfig)
@@ -216,6 +227,7 @@ end
 
 local function getBaseTopSpeed()
     if type(controller) ~= "table" then return 280 end
+
     local cached = rawget(controller, "cachedGears")
     local tops = type(cached) == "table" and rawget(cached, "topSpeeds") or nil
     local maxSpeed = 0
@@ -225,16 +237,39 @@ local function getBaseTopSpeed()
         end
     end
     if maxSpeed > 0 then return maxSpeed end
+
     local calc = rawget(controller, "calculatedTopSpeed")
     if type(calc) == "number" and calc > 0 then return calc end
     return 280
 end
 
+local function getThrottleIntent()
+    if currentSeat and currentSeat:IsA("VehicleSeat") then
+        local ok, value = pcall(function()
+            return currentSeat.ThrottleFloat
+        end)
+        if ok and type(value) == "number" then
+            return value
+        end
+        return 0
+    end
+
+    if type(controller) == "table" then
+        local sound = rawget(controller, "engineSound")
+        local value = type(sound) == "table" and rawget(sound, "throttle") or nil
+        if type(value) == "number" then return value end
+    end
+
+    return 0
+end
+
 local function gearText()
     if type(controller) ~= "table" then return nil end
+
     local instrument = rawget(controller, "instrumentScreen")
     local label = type(instrument) == "table" and rawget(instrument, "currentGearLabel") or nil
     local text = nil
+
     if typeof(label) == "Instance" then
         pcall(function()
             if label:IsA("TextLabel") or label:IsA("TextButton") or label:IsA("TextBox") then
@@ -244,6 +279,7 @@ local function gearText()
     elseif type(label) == "string" then
         text = label
     end
+
     if type(text) == "string" then
         return string.lower(text):gsub("[%s%._%-]", "")
     end
@@ -251,21 +287,20 @@ local function gearText()
 end
 
 local function reverseOrNeutralConfirmed(forwardSpeed)
-    if currentSeat and currentSeat:IsA("VehicleSeat") then
-        local ok, seatThrottle = pcall(function() return currentSeat.ThrottleFloat end)
-        if ok and type(seatThrottle) == "number" and seatThrottle < -0.04 then
-            return true
-        end
-    end
+    local throttle = getThrottleIntent()
+    if throttle < -THROTTLE_THRESHOLD then return true end
+
     local text = gearText()
     if text then
         if text == "r" or text == "re" or text == "ré" or text:find("reverse", 1, true) then return true end
         if text == "n" or text:find("neutral", 1, true) then return true end
     end
+
     if type(controller) == "table" then
         local gear = tonumber(rawget(controller, "gear"))
         if gear and gear <= 0 then return true end
     end
+
     if forwardSpeed < -0.25 then return true end
     return false
 end
@@ -273,20 +308,33 @@ end
 local function applyForwardAssist(dt)
     if not pressureEnabled then return end
     if not currentVehicle or not controller then return end
+
+    local throttle = getThrottleIntent()
+    if throttle <= THROTTLE_THRESHOLD then return end
+
     local main = getMainPart(currentVehicle)
     if not main or not main:IsDescendantOf(workspace) then return end
+
     local cf = main.CFrame
     local forwardSpeed = main.AssemblyLinearVelocity:Dot(cf.LookVector)
+
     if reverseOrNeutralConfirmed(forwardSpeed) then return end
     if forwardSpeed <= START_FORWARD_ASSIST then return end
+
     local baseTop = getBaseTopSpeed()
     local startTaper = baseTop * 0.68
     local factor = 1
     if forwardSpeed > startTaper then
-        factor = math.clamp((baseTop - forwardSpeed) / math.max(baseTop - startTaper, 1), 0, 1)
+        factor = math.clamp(
+            (baseTop - forwardSpeed) / math.max(baseTop - startTaper, 1),
+            0,
+            1
+        )
     end
+
     if factor > 0 then
-        main.AssemblyLinearVelocity = main.AssemblyLinearVelocity + cf.LookVector * (PRESSURE_ACCEL * factor * dt)
+        main.AssemblyLinearVelocity = main.AssemblyLinearVelocity
+            + cf.LookVector * (PRESSURE_ACCEL * factor * dt)
     end
 end
 
@@ -314,27 +362,37 @@ end
 
 local function installUIOverride()
     menuGui = locateMenu()
-    if not menuGui then error("Drive World V5.3: menu V5 base nao foi encontrado") end
+    if not menuGui then error("Drive World V5.3.1: menu V5 base nao foi encontrado") end
+
     for _, obj in ipairs(menuGui:GetDescendants()) do
         if obj:IsA("TextLabel") and tostring(obj.Text):find("DRIVE WORLD V5", 1, true) then
-            obj.Text = "PSICOSENATICO • DRIVE WORLD V5.3"
+            obj.Text = "PSICOSENATICO • DRIVE WORLD V5.3.1"
             break
         end
     end
+
     originalPressureButton = locatePressureButton(menuGui)
-    if not originalPressureButton then error("Drive World V5.3: botao PRESSAO+ da V5 nao foi encontrado") end
+    if not originalPressureButton then
+        error("Drive World V5.3.1: botao PRESSAO+ da V5 nao foi encontrado")
+    end
+
     originalPressureButton.Visible = false
+
     local button = originalPressureButton:Clone()
-    button.Name = "PressureV53"
+    button.Name = "PressureV531"
     button.Visible = true
     button.Text = "PRESSAO +: OFF"
     button.ZIndex = originalPressureButton.ZIndex + 10
     button.Parent = originalPressureButton.Parent
     customPressureButton = button
+
     connect(button.MouseButton1Click, function()
         pressureEnabled = not pressureEnabled
         button.Text = pressureEnabled and "PRESSAO +: ON" or "PRESSAO +: OFF"
-        button.BackgroundColor3 = pressureEnabled and Color3.fromRGB(38, 115, 82) or Color3.fromRGB(70, 75, 92)
+        button.BackgroundColor3 = pressureEnabled
+            and Color3.fromRGB(38, 115, 82)
+            or Color3.fromRGB(70, 75, 92)
+
         resolveTargets(true)
         if engineConfig then applyTorque(engineConfig) end
     end)
@@ -344,17 +402,23 @@ local function stop()
     if not running then return end
     running = false
     pressureEnabled = false
+
     if engineConfig then restoreTorque(engineConfig) end
+
     if originalPressureButton and originalPressureButton.Parent then
         pcall(function() originalPressureButton.Visible = true end)
     end
     if customPressureButton and customPressureButton.Parent then
         pcall(function() customPressureButton:Destroy() end)
     end
+
     for _, c in ipairs(connections) do
         pcall(function() c:Disconnect() end)
     end
-    if G.PSICO_DRIVE_V53_STOP == stop then G.PSICO_DRIVE_V53_STOP = nil end
+
+    if G.PSICO_DRIVE_V53_STOP == stop then
+        G.PSICO_DRIVE_V53_STOP = nil
+    end
 end
 
 G.PSICO_DRIVE_V53_STOP = stop
@@ -364,15 +428,18 @@ resolveTargets(true)
 
 connect(RunService.Heartbeat, function(dt)
     if not running then return end
+
     resolveTimer = resolveTimer + dt
     if resolveTimer >= 1 then
         resolveTimer = 0
         resolveTargets(false)
         if engineConfig then applyTorque(engineConfig) end
+
         if menuGui and not menuGui.Parent then
             stop()
             return
         end
     end
+
     applyForwardAssist(dt)
 end)
