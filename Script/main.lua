@@ -1,5 +1,6 @@
--- PSICOSENATICO | Drive World Vehicle Menu V5.1
--- Hotfix: Pressao+ respeita a marcha de re em vez de empurrar sempre para frente.
+-- PSICOSENATICO | Drive World Vehicle Menu V5.2
+-- Hotfix revisado: Pressao+ nunca injeta impulso para frente durante re/neutral.
+-- Usa o indicador de marcha do proprio carro + gear + direcao fisica antes de aplicar assistencia.
 
 local CORE_URL = "https://raw.githubusercontent.com/Psicosenatico/Drive-World/8a326ee9a89d7080667d5a4a40ddfc6506a1869b/Script/main.lua"
 local source = game:HttpGet(CORE_URL)
@@ -26,61 +27,122 @@ local newBlock = [[local function applyPressureAssist(dt, main, cf, forwardSpeed
     local throttle = getThrottleIntent()
     if math.abs(throttle) <= 0.04 then return end
 
-    -- No Drive World o pedal pode continuar positivo mesmo em re.
-    -- A marcha do controlador e a fonte mais confiavel para a direcao.
-    local gear = type(controller) == "table" and tonumber(rawget(controller, "gear")) or nil
-    local direction
-    if gear and gear < 0 then
-        direction = -1
-    elseif gear and gear > 0 then
-        direction = 1
-    else
-        direction = throttle < 0 and -1 or 1
-    end
+    -- O scan do Vulture mostrou uma relacao de re dedicada em gears[-1]
+    -- e cachedGears[-1]. Nao usamos apenas controller.gear porque o scan
+    -- anterior nao mediu uma manobra de re e esse campo pode atualizar tarde.
+    local reverseConfirmed = false
+    local forwardConfirmed = false
+    local neutralConfirmed = false
 
-    -- Velocidade medida na direcao da marcha atual.
-    local directionalSpeed = forwardSpeed * direction
-
-    -- Se ainda estiver rolando forte na direcao oposta, deixa o carro frear/trocar
-    -- de sentido naturalmente antes de aplicar o assistente.
-    if directionalSpeed < -1 then return end
-
-    local baseTop = getBaseTopSpeed()
-
-    -- A re tem seu proprio limite no cachedGears (ex.: indice -1).
-    if direction < 0 and type(controller) == "table" then
-        local cached = rawget(controller, "cachedGears")
-        local tops = type(cached) == "table" and rawget(cached, "topSpeeds") or nil
-        local reverseTop = type(tops) == "table" and tonumber(rawget(tops, -1)) or nil
-        if reverseTop and reverseTop ~= 0 then
-            baseTop = math.abs(reverseTop)
-        else
-            baseTop = math.min(baseTop, 55)
+    -- 1) Entrada nativa do assento, quando o jogo usa VehicleSeat.
+    if currentSeat and currentSeat:IsA("VehicleSeat") then
+        local seatThrottle
+        pcall(function() seatThrottle = currentSeat.ThrottleFloat end)
+        if type(seatThrottle) == "number" then
+            if seatThrottle < -0.04 then
+                reverseConfirmed = true
+            elseif seatThrottle > 0.04 then
+                forwardConfirmed = true
+            end
         end
     end
 
+    -- 2) Indicador de marcha que o proprio controlador fornece ao painel.
+    if type(controller) == "table" then
+        local instrument = rawget(controller, "instrumentScreen")
+        local label = type(instrument) == "table" and rawget(instrument, "currentGearLabel") or nil
+        local text
+
+        if typeof(label) == "Instance" then
+            pcall(function()
+                if label:IsA("TextLabel") or label:IsA("TextButton") or label:IsA("TextBox") then
+                    text = label.Text
+                end
+            end)
+        elseif type(label) == "string" then
+            text = label
+        end
+
+        if type(text) == "string" then
+            local normalized = string.lower(text):gsub("[%s%._%-]", "")
+            if normalized == "r"
+            or normalized == "re"
+            or normalized == "ré"
+            or normalized:find("reverse", 1, true) then
+                reverseConfirmed = true
+                forwardConfirmed = false
+            elseif normalized == "n"
+            or normalized:find("neutral", 1, true) then
+                neutralConfirmed = true
+            else
+                local displayedGear = tonumber(normalized)
+                if displayedGear and displayedGear > 0 and not reverseConfirmed then
+                    forwardConfirmed = true
+                end
+            end
+        end
+
+        -- 3) Estado numerico interno como confirmacao adicional.
+        local gear = tonumber(rawget(controller, "gear"))
+        if gear then
+            if gear < 0 then
+                reverseConfirmed = true
+                forwardConfirmed = false
+            elseif gear == 0 then
+                neutralConfirmed = true
+            end
+        end
+    end
+
+    -- 4) A propria velocidade longitudinal confirma a direcao depois que
+    -- o carro comeca a se mover. Isso cobre controladores que atrasam a marcha.
+    if forwardSpeed < -0.75 then
+        reverseConfirmed = true
+        forwardConfirmed = false
+    elseif forwardSpeed > 0.75 and not reverseConfirmed then
+        forwardConfirmed = true
+    end
+
+    -- Pressao+ deixa re e neutro inteiramente para a fisica original do jogo.
+    -- O aumento de TorqueCurve continua sendo tratado pelo controlador normal;
+    -- apenas o impulso artificial para frente e bloqueado aqui.
+    if reverseConfirmed or neutralConfirmed then return end
+
+    -- Se ainda estamos praticamente parados e nao ha confirmacao clara de
+    -- marcha para frente, esperamos o carro iniciar o movimento naturalmente.
+    if not forwardConfirmed then return end
+    if forwardSpeed < -0.25 then return end
+
+    local baseTop = getBaseTopSpeed()
     local startTaper = baseTop * 0.68
     local factor = 1
-    if directionalSpeed > startTaper then
+    if forwardSpeed > startTaper then
         factor = math.clamp(
-            (baseTop - directionalSpeed) / math.max(baseTop - startTaper, 1),
+            (baseTop - forwardSpeed) / math.max(baseTop - startTaper, 1),
             0,
             1
         )
     end
 
     if factor > 0 then
-        main.AssemblyLinearVelocity += cf.LookVector * (direction * PRESSURE_ACCEL * factor * dt)
+        main.AssemblyLinearVelocity += cf.LookVector * (PRESSURE_ACCEL * factor * dt)
     end
 end]]
 
 local patched, replacements = source:gsub(oldBlock, newBlock, 1)
 if replacements ~= 1 then
-    error("Drive World V5.1 hotfix: bloco Pressao+ nao encontrado")
+    error("Drive World V5.2 hotfix: bloco Pressao+ nao encontrado")
 end
+
+-- Marcacao visual clara para confirmar que a revisao nova foi carregada.
+patched = patched:gsub(
+    "PSICOSENATICO • DRIVE WORLD V5",
+    "PSICOSENATICO • DRIVE WORLD V5.2",
+    1
+)
 
 local fn, err = loadstring(patched)
 if not fn then
-    error("Drive World V5.1 compile error: " .. tostring(err))
+    error("Drive World V5.2 compile error: " .. tostring(err))
 end
 return fn()
